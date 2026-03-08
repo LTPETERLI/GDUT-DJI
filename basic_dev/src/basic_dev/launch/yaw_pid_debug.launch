@@ -1,0 +1,92 @@
+<launch>
+  <!--
+    Yaw PID 调试启动文件
+    用法：
+      roslaunch basic_dev yaw_pid_debug.launch stage:=p_only
+      roslaunch basic_dev yaw_pid_debug.launch stage:=pd
+      roslaunch basic_dev yaw_pid_debug.launch stage:=fine
+  -->
+
+  <!-- 调试阶段：p_only / pd / fine -->
+  <arg name="stage" default="p_only"/>
+
+  <!-- 公共安全参数 -->
+  <arg name="pose_topic" default="/airsim_node/drone_1/debug/pose_gt"/>
+  <arg name="cmd_topic" default="/airsim_node/drone_1/vel_body_cmd"/>
+  <arg name="target_topic" default="/yaw_tuner/target_yaw_deg"/>
+
+  <!-- 第一阶段：纯 P，先确认方向 -->
+  <group if="$(eval arg('stage') == 'p_only')">
+    <node pkg="basic_dev" type="yaw_tuner.py" name="yaw_tuner" output="screen">
+      <param name="pose_topic" value="$(arg pose_topic)"/>
+      <param name="cmd_topic" value="$(arg cmd_topic)"/>
+      <param name="target_topic" value="$(arg target_topic)"/>
+
+      <!-- 方向与坐标定义 -->
+      <param name="cmd_cw_positive" value="true"/>
+      <param name="invert_pose_yaw" value="false"/>
+      <param name="yaw_invert_direction" value="false"/>
+      <param name="target_cw_positive" value="true"/>
+
+      <!-- P-only -->
+      <param name="pure_p_mode" value="true"/>
+      <param name="fp_kp_yaw" value="0.5"/>
+      <param name="fp_kd_yaw_rate" value="0.0"/>
+
+      <!-- 安全限制 -->
+      <param name="yaw_soft_limit_deg" value="45.0"/>
+      <param name="max_yaw_accel_deg_s2" value="120.0"/>
+      <param name="disable_yaw_limit" value="false"/>
+    </node>
+  </group>
+
+  <!-- 第二阶段：PD 响应调试 -->
+  <group if="$(eval arg('stage') == 'pd')">
+    <node pkg="basic_dev" type="yaw_tuner.py" name="yaw_tuner" output="screen">
+      <param name="pose_topic" value="$(arg pose_topic)"/>
+      <param name="cmd_topic" value="$(arg cmd_topic)"/>
+      <param name="target_topic" value="$(arg target_topic)"/>
+
+      <!-- 方向与坐标定义 -->
+      <param name="cmd_cw_positive" value="true"/>
+      <param name="invert_pose_yaw" value="false"/>
+      <param name="yaw_invert_direction" value="false"/>
+      <param name="target_cw_positive" value="true"/>
+
+      <!-- PD -->
+      <param name="pure_p_mode" value="false"/>
+      <param name="fp_kp_yaw" value="1.5"/>
+      <param name="fp_kd_yaw_rate" value="0.2"/>
+
+      <!-- 安全限制 -->
+      <param name="yaw_soft_limit_deg" value="45.0"/>
+      <param name="max_yaw_accel_deg_s2" value="120.0"/>
+      <param name="disable_yaw_limit" value="false"/>
+    </node>
+  </group>
+
+  <!-- 第三阶段：精调 -->
+  <group if="$(eval arg('stage') == 'fine')">
+    <node pkg="basic_dev" type="yaw_tuner.py" name="yaw_tuner" output="screen">
+      <param name="pose_topic" value="$(arg pose_topic)"/>
+      <param name="cmd_topic" value="$(arg cmd_topic)"/>
+      <param name="target_topic" value="$(arg target_topic)"/>
+
+      <!-- 方向与坐标定义 -->
+      <param name="cmd_cw_positive" value="true"/>
+      <param name="invert_pose_yaw" value="false"/>
+      <param name="yaw_invert_direction" value="false"/>
+      <param name="target_cw_positive" value="true"/>
+
+      <!-- 精细调整 -->
+      <param name="pure_p_mode" value="false"/>
+      <param name="fp_kp_yaw" value="2.0"/>
+      <param name="fp_kd_yaw_rate" value="0.3"/>
+      <param name="yaw_soft_limit_deg" value="60.0"/>
+
+      <!-- 安全限制 -->
+      <param name="max_yaw_accel_deg_s2" value="120.0"/>
+      <param name="disable_yaw_limit" value="false"/>
+    </node>
+  </group>
+</launch>

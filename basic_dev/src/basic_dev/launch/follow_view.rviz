@@ -1,0 +1,95 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Selection
+    Name: Selection
+  - Class: rviz/Tool Properties
+    Name: Tool Properties
+  - Class: rviz/Views
+    Name: Views
+  - Class: rviz/Time
+    Name: Time
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Enabled: true
+      Name: Grid
+      Cell Size: 1
+      Plane: XY
+      Plane Cell Count: 40
+      Color: 160; 160; 160
+      Alpha: 0.5
+    - Class: rviz/Path
+      Enabled: true
+      Name: DesiredPath
+      Topic: /viz/desired_path
+      Color: 255; 220; 0
+      Alpha: 1
+      Buffer Length: 1
+      Line Width: 0.08
+    - Class: rviz/Path
+      Enabled: true
+      Name: ActualPath
+      Topic: /viz/actual_path
+      Color: 30; 220; 30
+      Alpha: 1
+      Buffer Length: 1
+      Line Width: 0.08
+    - Class: rviz/Marker
+      Enabled: true
+      Name: TargetPoint
+      Marker Topic: /viz/target_point
+      Namespaces:
+        target_point: true
+    - Class: rviz/MarkerArray
+      Enabled: true
+      Name: YawTunerMarkers
+      Marker Topic: /yaw_tuner/markers
+      Namespaces:
+        yaw_tuner: true
+    - Class: rviz/PointCloud2
+      Enabled: true
+      Name: CorridorMap
+      Topic: /viz/corridor_map
+      Color Transformer: Intensity
+      Size (m): 0.08
+      Style: Flat Squares
+    - Class: rviz/TF
+      Enabled: true
+      Name: TF
+      Frame Timeout: 15
+      Show Axes: true
+      Show Names: true
+  Enabled: true
+  Global Options:
+    Fixed Frame: map
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+      Topic: /initialpose
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+    - Class: rviz/PublishPoint
+      Single click: true
+      Topic: /clicked_point
+  Value: true
+  Views:
+    Current:
+      Class: rviz/ThirdPersonFollower
+      Distance: 8
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.3
+      Name: ThirdPersonFollower
+      Pitch: 0.45
+      Target Frame: drone_follow
+      Yaw: 0.3
+Window Geometry:
+  Height: 900
+  Width: 1500

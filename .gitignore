@@ -1,0 +1,26 @@
+# ROS / Catkin build outputs
+basic_dev/build/
+basic_dev/build_make/
+basic_dev/devel/
+basic_dev/install/
+basic_dev/logs/
+basic_dev/.catkin_tools/
+
+# CMake / Make
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# IDE
+.vscode/
+basic_dev/.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

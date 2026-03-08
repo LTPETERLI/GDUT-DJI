@@ -1,0 +1,5 @@
+<launch>
+  <arg name="rviz_config" default="$(find basic_dev)/launch/follow_view.rviz" />
+  <node pkg="rviz" type="rviz" name="rviz_follow" args="-d $(arg rviz_config)" output="screen" />
+</launch>
+
