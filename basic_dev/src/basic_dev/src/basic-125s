@@ -1,0 +1,984 @@
+#ifndef _BASIC_DEV_CPP_
+#define _BASIC_DEV_CPP_
+
+#include "basic_dev.hpp"
+#include <fstream>
+#include <sstream>
+#include <ros/package.h>
+
+int main(int argc, char** argv)
+{
+
+    ros::init(argc, argv, "basic_dev"); // 初始化ros 节点，命名为 basic
+    ros::NodeHandle n; // 创建node控制句柄
+    BasicDev go(&n);
+    return 0;
+}
+
+BasicDev::BasicDev(ros::NodeHandle *nh)
+{  
+    // ------------------------------
+    // 初始化图像传输与缓存
+    // ------------------------------
+    it = std::make_unique<image_transport::ImageTransport>(*nh); 
+    front_left_img = cv::Mat(480, 640, CV_8UC3, cv::Scalar(0));
+    front_right_img = cv::Mat(480, 640, CV_8UC3, cv::Scalar(0));
+    back_left_img = cv::Mat(480, 640, CV_8UC3, cv::Scalar(0));
+    back_right_img = cv::Mat(480, 640, CV_8UC3, cv::Scalar(0));
+
+    // ------------------------------
+    // 服务请求默认参数
+    // ------------------------------
+    takeoff.request.waitOnLastTask = 1;
+    land.request.waitOnLastTask = 1;
+
+    // ------------------------------
+    // 7字段速度控制消息默认值
+    // ------------------------------
+    velcmd.vx = 0;
+    velcmd.vy = 0;
+    velcmd.vz = 0;
+    velcmd.yawRate = 0;
+    velcmd.va = 10;
+    velcmd.stop = 0;
+    velcmd.header.stamp = ros::Time::now();
+
+    // ------------------------------
+    // 状态输入订阅
+    // ------------------------------
+    odom_suber = nh->subscribe<geometry_msgs::PoseStamped>("/airsim_node/drone_1/debug/pose_gt", 1, std::bind(&BasicDev::pose_cb, this, std::placeholders::_1));
+    gps_suber = nh->subscribe<geometry_msgs::PoseStamped>("/airsim_node/drone_1/gps", 1, std::bind(&BasicDev::gps_cb, this, std::placeholders::_1));
+    imu_suber = nh->subscribe<sensor_msgs::Imu>("/airsim_node/drone_1/imu/imu", 1, std::bind(&BasicDev::imu_cb, this, std::placeholders::_1));
+    lidar_suber = nh->subscribe<sensor_msgs::PointCloud2>("/airsim_node/drone_1/lidar", 1, std::bind(&BasicDev::lidar_cb, this, std::placeholders::_1));
+    pwm_feedback_suber = nh->subscribe<airsim_ros::RotorPWM>("/airsim_node/drone_1/debug/rotor_pwm", 1, std::bind(&BasicDev::pwm_feedback_cb, this, std::placeholders::_1));
+    initial_pose_suber = nh->subscribe<geometry_msgs::PoseStamped>("/airsim_node/initial_pose", 1, std::bind(&BasicDev::initial_pose_cb, this, std::placeholders::_1));
+    end_goal_suber = nh->subscribe<geometry_msgs::PoseStamped>("/airsim_node/end_goal", 1, std::bind(&BasicDev::end_goal_cb, this, std::placeholders::_1));
+
+    // ------------------------------
+    // 相机订阅（调试用）
+    // ------------------------------
+    front_left_view_suber = it->subscribe("/airsim_node/drone_1/front_left/Scene", 1, std::bind(&BasicDev::front_left_view_cb, this,  std::placeholders::_1));
+    front_right_view_suber = it->subscribe("/airsim_node/drone_1/front_right/Scene", 1, std::bind(&BasicDev::front_right_view_cb, this,  std::placeholders::_1));
+    back_left_view_suber = it->subscribe("/airsim_node/drone_1/back_left/Scene", 1, std::bind(&BasicDev::back_left_view_cb, this,  std::placeholders::_1));
+    back_right_view_suber = it->subscribe("/airsim_node/drone_1/back_right/Scene", 1, std::bind(&BasicDev::back_right_view_cb, this,  std::placeholders::_1));
+
+    // ------------------------------
+    // 服务客户端与控制发布器
+    // ------------------------------
+    takeoff_client = nh->serviceClient<airsim_ros::Takeoff>("/airsim_node/drone_1/takeoff");
+    land_client = nh->serviceClient<airsim_ros::Land>("/airsim_node/drone_1/land");
+    reset_client = nh->serviceClient<airsim_ros::Reset>("/airsim_node/reset");
+    vel_publisher = nh->advertise<airsim_ros::VelCmd>("/airsim_node/drone_1/vel_body_cmd", 1);
+    desired_path_pub_ = nh->advertise<nav_msgs::Path>("/viz/desired_path", 1, true);
+    actual_path_pub_ = nh->advertise<nav_msgs::Path>("/viz/actual_path", 1, false);
+    target_marker_pub_ = nh->advertise<visualization_msgs::Marker>("/viz/target_point", 1, false);
+    corridor_map_pub_ = nh->advertise<sensor_msgs::PointCloud2>("/viz/corridor_map", 1, false);
+
+    // 33Hz 控制定时器
+    control_timer = nh->createTimer(ros::Duration(0.03), &BasicDev::control_timer_cb, this);
+
+    // 竞速默认参数（Z轴按传统单环PID）
+    // 可通过参数调整测试速度和动作幅度
+    nh->param("test_speed_xy", test_speed_xy, 12.0);         // 测试平移阶段的平面速度（m/s）
+    nh->param("test_yaw_rate_deg", test_yaw_rate_deg, 45.0); // 测试旋转阶段角速度（deg/s）
+    nh->param("test_move_dist", test_move_dist, 15.0);       // 测试平移阶段目标位移（m）
+    nh->param("test_hover_sec", test_hover_sec, 0.0);        // 起飞后首次悬停时间（s）
+    nh->param("buffer_dist", buffer_dist_, 10.0);            // 路径跟踪前的前飞缓冲距离（m）
+    nh->param("buffer_vx", buffer_vx_, 16.0);                // 前飞缓冲段机体系前向速度（m/s）
+    nh->param("buffer_vz", buffer_vz_, 0.8);                 // 前飞缓冲段机体系竖直速度（m/s）
+    nh->param("buffer_max_climb", buffer_max_climb_, 0.9);   // 前飞缓冲段允许的最大相对爬升（m）
+    nh->param("buffer_hover_sec", buffer_hover_sec_, 0.0);   // 前飞缓冲结束后的悬停时间（s）
+    nh->param("max_vx", max_vx_, 18.0);                      // 路径跟踪时机体系X轴速度上限（m/s）
+    nh->param("max_vy", max_vy_, 7.0);                      // 路径跟踪时机体系Y轴速度上限（m/s）
+    nh->param("max_vz", max_vz_, 12.0);                 // 路径跟踪时机体系Z轴上升速度上限（m/s）
+    nh->param("max_vz_start_zone", max_vz_start_zone_, 2.6); // 起点后前段Z速度上限（m/s）
+
+    // CSV轨迹跟踪参数
+    // 轨迹CSV默认路径：优先使用宿主机绝对路径，其次包内文件，再次镜像根目录
+    std::string default_csv_path = "/home/peter/RMUA2026-LT/IntelligentUAVChampionshipBase-RMUA2026/basic_dev/gnss_path_fast_aligned.csv";
+    const std::string pkg_path = ros::package::getPath("basic_dev");
+    if (!pkg_path.empty()) {
+        const std::string candidate = pkg_path + "/gnss_path_fast_aligned.csv";
+        if (std::ifstream(candidate).good()) {
+            default_csv_path = candidate;
+        }
+    }
+    nh->param("csv_path", csv_path_, default_csv_path);
+    const bool csv_exists = std::ifstream(csv_path_).good();
+    ROS_INFO("csv_path=%s (exists=%d)", csv_path_.c_str(), static_cast<int>(csv_exists));
+    if (!csv_exists) {
+        ROS_WARN("csv_path file not found at startup; will try loading anyway when entering FOLLOW_PATH.");
+    }
+    nh->param("downsample_dist", downsample_dist_, 0.4);   // 轨迹点降采样间距（m）
+    nh->param("lookahead_dist", lookahead_dist_, 6.5);    // 前视距离（m），越大越平滑，越小越贴线
+    nh->param("reach_end_dist", reach_end_dist_, 0.6);     // 终点判定阈值（m）
+    nh->param("use_relative_path", use_relative_path_, false); // 是否把CSV首点对齐到当前起点（当前实现固定绝对坐标）
+    nh->param("invert_csv_y", invert_csv_y_, false);       // 是否对CSV的Y轴取反（默认不再翻转，表格已对齐方向）
+    nh->param("fp_kp_xy", fp_kp_xy_, 1.8);               // 兼容旧参数：平面P增益（默认同步为X轴）
+    nh->param("fp_kp_x", fp_kp_x_, 1.8);                 // 机体系X轴位置误差增益
+    nh->param("fp_kp_y", fp_kp_y_, 3.4);                 // 机体系Y轴位置误差增益
+    nh->param("fp_y_vel_damp", fp_y_vel_damp_, 1.5);     // 机体系Y轴速度阻尼增益
+    nh->param("fp_vy_lpf_alpha", fp_vy_lpf_alpha_, 0.40); // vy命令低通滤波系数(0~1)
+    nh->param("lateral_slow_err_thresh", lateral_slow_err_thresh_, 6.5); // 横向偏差超过阈值才降前向速度（m）
+    nh->param("late_lateral_err_thresh", late_lateral_err_thresh_, 20.0); // 飞行后段放宽的横向门控阈值（m）
+    nh->param("gate_relax_time_sec", gate_relax_time_sec_, 80.0);        // 启用放宽阈值的时间点（起飞后秒）
+    nh->param("lateral_slow_gain", lateral_slow_gain_, 0.22);             // 超阈值后的前向降速强度
+    nh->param("lateral_slow_min_scale", lateral_slow_min_scale_, 0.70);   // 前向降速最小比例
+    nh->param("z_lookahead_dist", z_lookahead_dist_, 0.2);// Z通道前视距离（m），越小越贴线
+    nh->param("max_vz_down", max_vz_down_, 10.0);   // Z轴下降速度上限（m/s，正值）
+    nh->param("z_pid_kp", z_pid_kp_, 5.2);             // Z-P增益
+    nh->param("z_pid_ki", z_pid_ki_, 1.4);               // Z-I增益
+    nh->param("z_pid_kd", z_pid_kd_, 0.8);           // Z-D增益
+    nh->param("z_pid_i_limit", z_pid_i_limit_, 2.2);       // Z轴积分限幅
+    nh->param("z_pid_d_lpf_alpha", z_pid_d_lpf_alpha_, 0.35); // Z轴速度误差低通系数
+    nh->param("z_vel_lpf_alpha", z_vel_lpf_alpha_, 0.30);     // Z轴实测速度低通系数
+    nh->param("z_ref_vel_lpf_alpha", z_ref_vel_lpf_alpha_, 0.35); // Z轴目标速度低通系数
+    nh->param("z_ref_vel_ff_gain", z_ref_vel_ff_gain_, 2.2); // Z轴目标速度前馈增益
+    nh->param("fp_kp_yaw", fp_kp_yaw_, 3.0);               // 航向P增益：yaw误差->yawRate（与yaw_tuner快档一致）
+    nh->param("fp_kd_yaw_rate", fp_kd_yaw_rate_, 0.12);    // 航向D增益：抑制过冲（基于实测偏航角速度）
+    nh->param("yaw_rate_lpf_alpha", yaw_rate_lpf_alpha_, 0.32); // 偏航角速度低通滤波系数(0~1)
+    nh->param("yaw_soft_limit_deg", yaw_soft_limit_deg_, 80.0); // yawRate软限幅（deg/s，与yaw_tuner快档一致）
+    nh->param("yaw_stop_tolerance_deg", yaw_stop_tolerance_deg_, 0.8); // 航向停止容差（deg）
+    nh->param("yaw_min_cmd_deg", yaw_min_cmd_deg_, 4.5);   // 航向最小角速度（deg/s），避免末段太慢
+    nh->param("enable_yaw_only_gate", enable_yaw_only_gate_, true); // 是否启用大角误差只转不走门控
+    nh->param("yaw_only_deg", yaw_only_deg_, 50.0);        // 启用门控时的阈值（deg）
+    nh->param("pose_gt_is_ned", pose_gt_is_ned_, true);    // pose_gt是否按NED输入（true会做NED->ZUP转换）
+    nh->param("use_takeoff_service", use_takeoff_service_, false); // 是否调用起飞服务
+    ros::NodeHandle pnh("~");
+    pnh.param("viz_frame_id", viz_frame_id_, std::string("map"));
+    pnh.param("publish_follow_tf", publish_follow_tf_, true);
+    pnh.param("follow_frame_id", follow_frame_id_, std::string("drone_follow"));
+    pnh.param("actual_append_dist", actual_append_dist_, 0.05);
+    int actual_max_points_param = static_cast<int>(actual_max_points_);
+    pnh.param("actual_max_points", actual_max_points_param, 3000);
+    actual_max_points_ = static_cast<size_t>(std::max(100, actual_max_points_param));
+    pnh.param("corridor_enable", corridor_enable_, true);
+    pnh.param("corridor_voxel_leaf", corridor_voxel_leaf_, 0.25);
+    pnh.param("corridor_min_range", corridor_min_range_, 0.6);
+    pnh.param("corridor_max_range", corridor_max_range_, 45.0);
+    pnh.param("corridor_pub_hz", corridor_pub_hz_, 2.0);
+    int corridor_max_points_param = static_cast<int>(corridor_max_points_);
+    pnh.param("corridor_max_points", corridor_max_points_param, 250000);
+    corridor_max_points_ = static_cast<size_t>(std::max(1000, corridor_max_points_param));
+    corridor_cloud_.reset(new pcl::PointCloud<pcl::PointXYZ>());
+    corridor_cloud_->reserve(corridor_max_points_);
+    corridor_voxel_keys_.reserve(corridor_max_points_);
+
+    // 参数限幅保护（保留物理合理范围，不再做“下限强推快档”）
+    fp_kd_yaw_rate_ = std::max(fp_kd_yaw_rate_, 0.0);
+    yaw_rate_lpf_alpha_ = std::max(0.0, std::min(1.0, yaw_rate_lpf_alpha_));
+    yaw_stop_tolerance_deg_ = std::max(yaw_stop_tolerance_deg_, 0.0);
+    yaw_min_cmd_deg_ = std::max(yaw_min_cmd_deg_, 0.0);
+    // 兼容旧字段：统一把fp_kp_xy同步为X轴增益，防止旧逻辑读取到低值
+    fp_kp_xy_ = fp_kp_x_;
+
+    ROS_WARN("Z参数(启动生效): z_kp=%.3f z_ki=%.3f z_kd=%.3f z_i_lim=%.3f z_ff=%.3f z_lh=%.3f max_vz=%.3f max_vz_down=%.3f",
+             z_pid_kp_, z_pid_ki_, z_pid_kd_, z_pid_i_limit_,
+             z_ref_vel_ff_gain_, z_lookahead_dist_, max_vz_, max_vz_down_);
+
+    ROS_INFO("basic_dev 已启动：起飞后进入CSV航迹跟踪模式（invert_csv_y=%d, pose_gt_is_ned=%d）。",
+        static_cast<int>(invert_csv_y_), static_cast<int>(pose_gt_is_ned_));
+    ros::spin();
+}
+
+BasicDev::~BasicDev()
+{
+}
+
+double BasicDev::clamp_value(double value, double lower, double upper)
+{
+    if (value < lower) return lower;
+    if (value > upper) return upper;
+    return value;
+}
+
+const char* BasicDev::phase_name(TestPhase p) const
+{
+    switch (p) {
+    case TestPhase::WAITING_DATA: return "WAITING_DATA";
+    case TestPhase::HOVER_AFTER_TAKEOFF: return "HOVER_AFTER_TAKEOFF";
+    case TestPhase::MOVE_FORWARD_BUFFER: return "MOVE_FORWARD_BUFFER";
+    case TestPhase::HOVER_AFTER_BUFFER: return "HOVER_AFTER_BUFFER";
+    case TestPhase::FOLLOW_PATH: return "FOLLOW_PATH";
+    case TestPhase::MOVE_FORWARD: return "MOVE_FORWARD";
+    case TestPhase::MOVE_BACKWARD: return "MOVE_BACKWARD";
+    case TestPhase::MOVE_RIGHT: return "MOVE_RIGHT";
+    case TestPhase::MOVE_LEFT: return "MOVE_LEFT";
+    case TestPhase::YAW_CW: return "YAW_CW";
+    case TestPhase::YAW_CCW: return "YAW_CCW";
+    case TestPhase::FINISH: return "FINISH";
+    default: return "UNKNOWN";
+    }
+}
+
+void BasicDev::enter_phase(TestPhase p, const ros::Time& now)
+{
+    phase = p;
+    phase_start_time = now;
+    if (phase == TestPhase::FOLLOW_PATH) {
+        // 切入路径跟踪时重置Z轴PID，避免前一阶段积分/微分残留
+        z_pid_int_ = 0.0;
+        z_pid_prev_err_ = 0.0;
+        z_pid_d_filt_ = 0.0;
+        z_pid_inited_ = false;
+        z_vel_inited_ = false;
+        z_prev_meas_ = 0.0;
+        z_prev_ref_ = 0.0;
+        z_vel_meas_filt_ = 0.0;
+        z_ref_vel_filt_ = 0.0;
+        yaw_rate_inited_ = false;
+        yaw_prev_rad_ = 0.0;
+        yaw_rate_meas_filt_ = 0.0;
+    }
+    ROS_INFO("进入阶段: %s", phase_name(phase));
+}
+
+double BasicDev::phase_elapsed(const ros::Time& now) const
+{
+    return (now - phase_start_time).toSec();
+}
+
+static inline double clampd(double v, double lo, double hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+static inline double wrap_pi_rad(double rad)
+{
+    while (rad > M_PI) rad -= 2.0 * M_PI;
+    while (rad < -M_PI) rad += 2.0 * M_PI;
+    return rad;
+}
+
+static inline double quat_to_yaw_rad(const Eigen::Quaterniond& q)
+{
+    const Eigen::Quaterniond qn = q.normalized();
+    const double siny_cosp = 2.0 * (qn.w() * qn.z() + qn.x() * qn.y());
+    const double cosy_cosp = 1.0 - 2.0 * (qn.y() * qn.y() + qn.z() * qn.z());
+    return std::atan2(siny_cosp, cosy_cosp);
+}
+
+static inline Eigen::Quaterniond quat_ned_to_zup(const Eigen::Quaterniond& q_ned)
+{
+    // Internal convention: x forward, y right, z up.
+    // AirSim GPS pose uses z-down convention, so convert rotation by reflecting z axis.
+    Eigen::Matrix3d S = Eigen::Matrix3d::Identity();
+    S(2, 2) = -1.0;
+    const Eigen::Matrix3d R_int = S * q_ned.normalized().toRotationMatrix() * S;
+    return Eigen::Quaterniond(R_int).normalized();
+}
+
+static inline long long pack_voxel_key(int ix, int iy, int iz)
+{
+    // 3D 体素索引打包为 64 位键值（每轴21bit，带符号偏移）
+    constexpr long long kBits = 21;
+    constexpr long long kMask = (1LL << kBits) - 1LL;
+    constexpr long long kOffset = 1LL << (kBits - 1LL);
+    const long long x = (static_cast<long long>(ix) + kOffset) & kMask;
+    const long long y = (static_cast<long long>(iy) + kOffset) & kMask;
+    const long long z = (static_cast<long long>(iz) + kOffset) & kMask;
+    return (x << (kBits * 2LL)) | (y << kBits) | z;
+}
+
+bool BasicDev::load_path_from_csv(const Eigen::Vector3d& start_world)
+{
+    (void)start_world;
+    std::ifstream fin(csv_path_);
+    if (!fin.is_open()) {
+        ROS_ERROR("Cannot open csv_path: %s", csv_path_.c_str());
+        return false;
+    }
+    std::string line;
+    std::getline(fin, line); // header
+
+    std::vector<Eigen::Vector3d> raw;
+    raw.reserve(6000);
+
+    while (std::getline(fin, line)) {
+        if (line.empty()) continue;
+        const auto pos = line.find_first_not_of(" \t\r");
+        if (pos == std::string::npos) continue;
+        if (line[pos] == '#') continue;
+
+        std::stringstream ss(line);
+        std::string tok;
+        std::vector<double> vals;
+        try {
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) vals.push_back(std::stod(tok));
+            }
+        } catch (...) {
+            continue;
+        }
+        if (vals.size() < 4) continue; // t,x,y,z
+
+        const double x = vals[1];
+        double y = vals[2];
+        if (invert_csv_y_) {
+            y = -y;
+        }
+        const double z = vals[3];
+        raw.emplace_back(x, y, z);
+    }
+
+    if (raw.size() < 2) {
+        ROS_ERROR("CSV points too few: %zu", raw.size());
+        return false;
+    }
+
+    // 按CSV绝对坐标直接使用，不做任何平移对齐
+    if (use_relative_path_) {
+        ROS_WARN_THROTTLE(2.0, "use_relative_path=true 已被忽略：当前固定使用CSV绝对坐标。");
+    }
+
+    // downsample by distance
+    std::vector<Eigen::Vector3d> ds;
+    ds.reserve(raw.size());
+    ds.push_back(raw.front());
+    for (size_t i = 1; i < raw.size(); ++i) {
+        if ((raw[i] - ds.back()).norm() >= downsample_dist_)
+            ds.push_back(raw[i]);
+    }
+    if ((ds.back() - raw.back()).norm() > 1e-6) ds.push_back(raw.back());
+
+    path_pts_.swap(ds);
+    path_s_.clear();
+    path_s_.reserve(path_pts_.size());
+    double acc_s = 0.0;
+    path_s_.push_back(0.0);
+    for (size_t i = 1; i < path_pts_.size(); ++i) {
+        acc_s += (path_pts_[i] - path_pts_[i - 1]).norm();
+        path_s_.push_back(acc_s);
+    }
+    path_loaded_ = true;
+    publish_desired_path_once();
+
+    ROS_INFO("Path loaded: raw=%zu downsample=%zu first=(%.2f %.2f %.2f) last=(%.2f %.2f %.2f)",
+             raw.size(), path_pts_.size(),
+             path_pts_.front().x(), path_pts_.front().y(), path_pts_.front().z(),
+             path_pts_.back().x(),  path_pts_.back().y(),  path_pts_.back().z());
+    return true;
+}
+
+size_t BasicDev::find_nearest_index(const Eigen::Vector3d& p) const
+{
+    size_t best = 0;
+    double best_d2 = 1e18;
+    for (size_t i = 0; i < path_pts_.size(); ++i) {
+        const double d2 = (path_pts_[i] - p).squaredNorm();
+        if (d2 < best_d2) { best_d2 = d2; best = i; }
+    }
+    return best;
+}
+
+size_t BasicDev::find_lookahead_index(size_t i_near, double L) const
+{
+    double acc = 0.0;
+    for (size_t i = i_near; i + 1 < path_pts_.size(); ++i) {
+        acc += (path_pts_[i + 1] - path_pts_[i]).norm();
+        if (acc >= L) return i + 1;
+    }
+    return path_pts_.size() - 1;
+}
+
+void BasicDev::path_follow_step(double& vx, double& vy, double& vz, double& yaw_deg, bool& finished)
+{
+    // 单步路径跟踪：
+    // 1) 找最近点 + 前视点
+    // 2) 计算世界系误差并变换到机体系
+    // 3) P控制输出速度 + 限幅
+    // 4) 大角误差时先转向后平移
+    finished = false;
+    vx = vy = vz = yaw_deg = 0.0;
+    if (!path_loaded_ || path_pts_.size() < 2) return;
+
+    const size_t i_near = find_nearest_index(current_pos);
+    const size_t i_tar  = find_lookahead_index(i_near, lookahead_dist_);
+    const Eigen::Vector3d p_tar = path_pts_[i_tar];
+    publish_target_marker(p_tar);
+
+    const Eigen::Vector3d e_w = p_tar - current_pos;
+
+    // 用当前姿态把误差从世界系转换到机体系，避免直接用欧拉角带来的符号混淆
+    const Eigen::Matrix3d R_wb = current_quat.normalized().toRotationMatrix(); // body->world
+    const Eigen::Vector3d e_b  = R_wb.transpose() * e_w;                        // world->body
+
+    // yaw误差（命令符号约定）：正值=顺时针需求，使用与XY一致的前视点
+    const double yaw_err = std::atan2(e_b.y(), e_b.x());
+    const double yaw_err_deg = yaw_err * 180.0 / M_PI;
+    // 偏航角速度估计（由姿态差分得到，CCW为正，单位deg/s）
+    const ros::Time yaw_now = ros::Time::now();
+    double yaw_rate_meas_ccw = 0.0;
+    const double yaw_cur_rad = quat_to_yaw_rad(current_quat);
+    if (!yaw_rate_inited_) {
+        yaw_rate_inited_ = true;
+        yaw_prev_rad_ = yaw_cur_rad;
+        yaw_prev_time_ = yaw_now;
+        yaw_rate_meas_filt_ = 0.0;
+    } else {
+        const double dt_yaw = clampd((yaw_now - yaw_prev_time_).toSec(), 0.005, 0.10);
+        const double yaw_delta = wrap_pi_rad(yaw_cur_rad - yaw_prev_rad_);
+        const double yaw_rate_raw = yaw_delta * 180.0 / M_PI / std::max(1e-3, dt_yaw);
+        yaw_rate_meas_filt_ =
+            (1.0 - yaw_rate_lpf_alpha_) * yaw_rate_meas_filt_ + yaw_rate_lpf_alpha_ * yaw_rate_raw;
+        yaw_rate_meas_ccw = yaw_rate_meas_filt_;
+        yaw_prev_rad_ = yaw_cur_rad;
+        yaw_prev_time_ = yaw_now;
+    }
+
+    // yaw PD控制（输出约定：正值=顺时针）
+    // yaw_err_deg 正表示应顺时针；yaw_rate_meas_ccw 正表示当前逆时针
+    // 因此 D项使用 +Kd*omega_ccw：当机体逆时针转动时增大顺时针指令，抑制反向摆动
+    if (std::fabs(yaw_err_deg) <= yaw_stop_tolerance_deg_) {
+        yaw_deg = 0.0;
+    } else {
+        yaw_deg = fp_kp_yaw_ * yaw_err_deg + fp_kd_yaw_rate_ * yaw_rate_meas_ccw;
+        yaw_deg = clampd(yaw_deg, -yaw_soft_limit_deg_, yaw_soft_limit_deg_);
+        if (std::fabs(yaw_deg) < yaw_min_cmd_deg_) {
+            yaw_deg = (yaw_err_deg >= 0.0) ? yaw_min_cmd_deg_ : -yaw_min_cmd_deg_;
+        }
+    }
+
+    // 平面速度控制：误差越大速度越大，然后做上限限幅
+    vx = clampd(fp_kp_x_ * e_b.x(), -max_vx_, max_vx_);
+    vy = clampd(fp_kp_y_ * e_b.y(), -max_vy_, max_vy_);
+    // 小改动：只在横向偏差超过阈值时才降低前向推进，避免全程被拖慢
+    double vx_lateral_scale = 1.0;
+    const double ey_abs = std::fabs(e_b.y());
+    double lateral_thresh_now = lateral_slow_err_thresh_;
+    const ros::Time t_now_for_gate = ros::Time::now();
+    if (!takeoff_success_time.isZero()) {
+        const double flight_time = (t_now_for_gate - takeoff_success_time).toSec();
+        if (flight_time >= gate_relax_time_sec_) {
+            lateral_thresh_now = late_lateral_err_thresh_;
+        }
+    }
+    if (ey_abs > lateral_thresh_now) {
+        const double ey_excess = ey_abs - lateral_thresh_now;
+        vx_lateral_scale = clampd(1.0 / (1.0 + lateral_slow_gain_ * ey_excess), lateral_slow_min_scale_, 1.0);
+    }
+    vx *= vx_lateral_scale;
+    // 抑制“贴线段”左右摇晃：仅在横向误差较小时对vy做轻量低通，不影响大偏差快速纠偏
+    const double vy_alpha = clampd(fp_vy_lpf_alpha_, 0.0, 1.0);
+    if (!xy_vel_inited_) {
+        vy_cmd_filt_ = vy;
+        xy_vel_inited_ = true;
+    } else if (ey_abs < 4.0) {
+        vy_cmd_filt_ = (1.0 - vy_alpha) * vy_cmd_filt_ + vy_alpha * vy;
+        vy = vy_cmd_filt_;
+    } else {
+        vy_cmd_filt_ = vy;
+    }
+
+    // 高度控制：传统单环PID（误差->PID->vz）
+    const size_t i_tar_z = find_lookahead_index(i_near, std::max(0.0, z_lookahead_dist_));
+    const double z_target = path_pts_[i_tar_z].z();
+    const double dz_w = z_target - current_pos.z(); // 内部采用z-up：目标更高时dz_w>0
+
+    // --- Z轴PID核心（D项使用速度环：v_err = v_ref - v_meas） ---
+    const ros::Time z_now = ros::Time::now();
+    double dt = 0.03;
+    if (z_pid_inited_) {
+        dt = clampd((z_now - z_pid_prev_time_).toSec(), 0.005, 0.10);
+    } else {
+        z_pid_int_ = 0.0;
+        z_pid_prev_err_ = dz_w;
+        z_pid_d_filt_ = 0.0;
+        z_pid_inited_ = true;
+    }
+
+    // 初始化速度环状态
+    if (!z_vel_inited_) {
+        z_prev_meas_ = current_pos.z();
+        z_prev_ref_ = z_target;
+        z_vel_meas_filt_ = 0.0;
+        z_ref_vel_filt_ = 0.0;
+        z_vel_inited_ = true;
+    }
+
+    // 估计实际竖直速度（来自当前位置差分）
+    const double v_meas_raw = (current_pos.z() - z_prev_meas_) / std::max(1e-3, dt);
+    z_vel_meas_filt_ =
+        (1.0 - z_vel_lpf_alpha_) * z_vel_meas_filt_ + z_vel_lpf_alpha_ * v_meas_raw;
+    z_prev_meas_ = current_pos.z();
+
+    // 估计目标竖直速度（来自目标z变化差分），用于速度前馈
+    const double v_ref_raw = (z_target - z_prev_ref_) / std::max(1e-3, dt);
+    z_ref_vel_filt_ =
+        (1.0 - z_ref_vel_lpf_alpha_) * z_ref_vel_filt_ + z_ref_vel_lpf_alpha_ * v_ref_raw;
+    z_prev_ref_ = z_target;
+
+    const double v_ref = clampd(z_ref_vel_ff_gain_ * z_ref_vel_filt_, -max_vz_down_, max_vz_);
+    const double v_err = v_ref - z_vel_meas_filt_;
+
+    // 误差符号切换时衰减积分，减少“反向拖尾”
+    if ((dz_w > 0.0 && z_pid_int_ < 0.0) || (dz_w < 0.0 && z_pid_int_ > 0.0)) {
+        z_pid_int_ *= 0.5;
+    }
+
+    z_pid_d_filt_ = (1.0 - z_pid_d_lpf_alpha_) * z_pid_d_filt_ + z_pid_d_lpf_alpha_ * v_err;
+
+    // 先用候选积分计算一次，做抗饱和判定
+    const double int_candidate = clampd(z_pid_int_ + dz_w * dt, -z_pid_i_limit_, z_pid_i_limit_);
+    const double u_unsat_candidate = z_pid_kp_ * dz_w + z_pid_ki_ * int_candidate + z_pid_kd_ * z_pid_d_filt_;
+    const double u_sat_candidate = clampd(u_unsat_candidate, -max_vz_down_, max_vz_);
+    const bool allow_integrate =
+        (std::fabs(u_unsat_candidate - u_sat_candidate) < 1e-6) ||
+        ((u_unsat_candidate > u_sat_candidate) && (dz_w < 0.0)) ||
+        ((u_unsat_candidate < u_sat_candidate) && (dz_w > 0.0));
+    if (allow_integrate) {
+        z_pid_int_ = int_candidate;
+    }
+
+    const double u_unsat = z_pid_kp_ * dz_w + z_pid_ki_ * z_pid_int_ + z_pid_kd_ * z_pid_d_filt_;
+    vz = clampd(u_unsat, -max_vz_down_, max_vz_);
+
+    z_pid_prev_err_ = dz_w;
+    z_pid_prev_time_ = z_now;
+
+    // 角误差过大时做“降速门控”（不再清零），避免横冲导致偏航/撞墙
+    if (enable_yaw_only_gate_ && std::fabs(yaw_err_deg) > yaw_only_deg_) {
+        // 只衰减前向速度，横向纠偏速度vy保持不变
+        const double kMinScaleVx = 0.20;
+        const double scale_vx = clampd(yaw_only_deg_ / std::fabs(yaw_err_deg), kMinScaleVx, 1.0);
+        vx *= scale_vx;
+    }
+
+    const double dist_end = (path_pts_.back() - current_pos).norm();
+    if (dist_end < reach_end_dist_) finished = true;
+
+    ROS_INFO_THROTTLE(0.5, "[PATH] near=%zu tar=%zu tar_z=%zu yaw_err=%.1f wccw=%.1f dz=%.2f vref=%.2f vz=%.2f zi=%.2f vd=%.2f dist_end=%.2f e_b=(%.2f %.2f %.2f) cmd=(%.2f %.2f %.2f %.1f)",
+                      i_near, i_tar, i_tar_z, yaw_err_deg, yaw_rate_meas_ccw, dz_w, v_ref, z_vel_meas_filt_, z_pid_int_, z_pid_d_filt_,
+                      dist_end, e_b.x(), e_b.y(), e_b.z(), vx, vy, vz, yaw_deg);
+}
+
+void BasicDev::publish_desired_path_once()
+{
+    if (!path_loaded_ || path_pts_.size() < 2) return;
+    if (!desired_path_msg_.poses.empty()) {
+        desired_path_msg_.header.stamp = ros::Time::now();
+        desired_path_msg_.header.frame_id = viz_frame_id_;
+        desired_path_pub_.publish(desired_path_msg_);
+        return;
+    }
+
+    desired_path_msg_.poses.clear();
+    desired_path_msg_.header.frame_id = viz_frame_id_;
+    desired_path_msg_.header.stamp = ros::Time::now();
+    desired_path_msg_.poses.reserve(path_pts_.size());
+
+    for (const auto& p : path_pts_) {
+        geometry_msgs::PoseStamped ps;
+        ps.header.frame_id = viz_frame_id_;
+        ps.header.stamp = ros::Time::now();
+        ps.pose.position.x = p.x();
+        ps.pose.position.y = p.y();
+        ps.pose.position.z = p.z();
+        ps.pose.orientation.x = 0.0;
+        ps.pose.orientation.y = 0.0;
+        ps.pose.orientation.z = 0.0;
+        ps.pose.orientation.w = 1.0;
+        desired_path_msg_.poses.push_back(ps);
+    }
+    desired_path_pub_.publish(desired_path_msg_);
+}
+
+void BasicDev::update_and_publish_actual_path()
+{
+    if (!has_gps) return;
+
+    if (!rviz_inited_) {
+        actual_path_msg_.poses.clear();
+        actual_path_msg_.header.frame_id = viz_frame_id_;
+        actual_path_msg_.header.stamp = ros::Time::now();
+        rviz_inited_ = true;
+        last_actual_pos_valid_ = false;
+    }
+
+    const Eigen::Vector3d p = current_pos;
+    bool append = false;
+    if (!last_actual_pos_valid_) {
+        append = true;
+    } else if ((p - last_actual_pos_).norm() >= actual_append_dist_) {
+        append = true;
+    }
+
+    if (append) {
+        geometry_msgs::PoseStamped ps;
+        ps.header.stamp = ros::Time::now();
+        ps.header.frame_id = viz_frame_id_;
+        ps.pose.position.x = p.x();
+        ps.pose.position.y = p.y();
+        ps.pose.position.z = p.z();
+        ps.pose.orientation.x = current_quat.x();
+        ps.pose.orientation.y = current_quat.y();
+        ps.pose.orientation.z = current_quat.z();
+        ps.pose.orientation.w = current_quat.w();
+        actual_path_msg_.poses.push_back(ps);
+        last_actual_pos_ = p;
+        last_actual_pos_valid_ = true;
+    }
+
+    if (actual_path_msg_.poses.size() > actual_max_points_) {
+        const size_t erase_n = std::min<size_t>(500, actual_path_msg_.poses.size() / 2);
+        actual_path_msg_.poses.erase(actual_path_msg_.poses.begin(),
+                                     actual_path_msg_.poses.begin() + static_cast<long>(erase_n));
+    }
+
+    actual_path_msg_.header.stamp = ros::Time::now();
+    actual_path_msg_.header.frame_id = viz_frame_id_;
+    actual_path_pub_.publish(actual_path_msg_);
+}
+
+void BasicDev::publish_target_marker(const Eigen::Vector3d& p_tar)
+{
+    visualization_msgs::Marker m;
+    m.header.stamp = ros::Time::now();
+    m.header.frame_id = viz_frame_id_;
+    m.ns = "target_point";
+    m.id = 0;
+    m.type = visualization_msgs::Marker::SPHERE;
+    m.action = visualization_msgs::Marker::ADD;
+    m.pose.position.x = p_tar.x();
+    m.pose.position.y = p_tar.y();
+    m.pose.position.z = p_tar.z();
+    m.pose.orientation.x = 0.0;
+    m.pose.orientation.y = 0.0;
+    m.pose.orientation.z = 0.0;
+    m.pose.orientation.w = 1.0;
+    m.scale.x = 0.25;
+    m.scale.y = 0.25;
+    m.scale.z = 0.25;
+    m.color.a = 1.0;
+    m.color.r = 1.0;
+    m.color.g = 0.0;
+    m.color.b = 0.0;
+    target_marker_pub_.publish(m);
+}
+
+void BasicDev::publish_follow_tf()
+{
+    if (!publish_follow_tf_ || !has_gps) return;
+
+    geometry_msgs::TransformStamped tf_msg;
+    tf_msg.header.stamp = ros::Time::now();
+    tf_msg.header.frame_id = viz_frame_id_;
+    tf_msg.child_frame_id = follow_frame_id_;
+    tf_msg.transform.translation.x = current_pos.x();
+    tf_msg.transform.translation.y = current_pos.y();
+    tf_msg.transform.translation.z = current_pos.z();
+    tf_msg.transform.rotation.x = current_quat.x();
+    tf_msg.transform.rotation.y = current_quat.y();
+    tf_msg.transform.rotation.z = current_quat.z();
+    tf_msg.transform.rotation.w = current_quat.w();
+    tf_broadcaster_.sendTransform(tf_msg);
+}
+
+void BasicDev::publish_velocity_cmd(double vx, double vy, double vz, double yaw_rate, uint8_t stop)
+{
+    velcmd.header.stamp = ros::Time::now();
+    velcmd.vx = vx;
+    velcmd.vy = vy;
+    velcmd.vz = vz;
+    velcmd.yawRate = yaw_rate;
+    velcmd.va =10; // 固定值，暂不使用
+    velcmd.stop = stop;
+    vel_publisher.publish(velcmd);
+}
+
+void BasicDev::control_timer_cb(const ros::TimerEvent& event)
+{
+    (void)event;
+    const ros::Time now = ros::Time::now();
+    update_and_publish_actual_path();
+    publish_follow_tf();
+
+    if (!has_gps || !has_init_pose) {
+        publish_velocity_cmd(0.0, 0.0, 0.0, 0.0, 0);
+        ROS_INFO_THROTTLE(1.0, "等待数据: gps=%d init=%d",
+            (int)has_gps, (int)has_init_pose);
+        return;
+    }
+
+    // 阶段1：起飞处理（可配置是否调用服务）
+    if (!has_takeoff) {
+        if (!use_takeoff_service_) {
+            has_takeoff = true;
+            takeoff_success_time = now;
+            enter_phase(TestPhase::HOVER_AFTER_TAKEOFF, now);
+            ROS_INFO("已跳过起飞服务，直接进入控制流程。");
+            return;
+        }
+
+        publish_velocity_cmd(0.0, 0.0, 0.0, 0.0, 0);
+        if ((now - last_takeoff_try).toSec() > 1.0) {
+            last_takeoff_try = now;
+            if (takeoff_client.exists() || takeoff_client.waitForExistence(ros::Duration(0.2))) {
+                const bool called = takeoff_client.call(takeoff);
+                if (called && takeoff.response.success) {
+                    has_takeoff = true;
+                    takeoff_success_time = now;
+                    enter_phase(TestPhase::HOVER_AFTER_TAKEOFF, now);
+                    ROS_INFO("起飞成功，开始顺序动作测试。");
+                } else {
+                    ROS_WARN("起飞调用失败或success=false，继续重试。");
+                }
+            } else {
+                ROS_WARN("起飞服务未就绪，继续重试。");
+            }
+        }
+        return;
+    }
+
+    const double elapsed = phase_elapsed(now);
+
+    double vx_cmd = 0.0;
+    double vy_cmd = 0.0;
+    double vz_cmd = 0.0;
+    double yaw_rate_cmd = 0.0;
+
+    switch (phase) {
+    case TestPhase::WAITING_DATA:
+        enter_phase(TestPhase::HOVER_AFTER_TAKEOFF, now);
+        break;
+    case TestPhase::HOVER_AFTER_TAKEOFF:
+        if (elapsed >= test_hover_sec) {
+            enter_phase(TestPhase::MOVE_FORWARD_BUFFER, now);
+        }
+        break;
+    case TestPhase::MOVE_FORWARD_BUFFER: {
+        const double vx_forward = std::fabs(buffer_vx_);
+        const double buffer_time = std::fabs(buffer_dist_) / std::max(0.1, vx_forward);
+        const double rel_climb = current_pos.z() - init_pos.z();
+        vx_cmd = vx_forward;
+        vy_cmd = 0.0;
+        vz_cmd = (rel_climb >= buffer_max_climb_ && buffer_vz_ > 0.0) ? 0.0 : buffer_vz_;
+        yaw_rate_cmd = 0.0;
+        if (elapsed >= buffer_time) {
+            ROS_INFO("斜向缓冲完成: elapsed=%.2f s, 约前飞=%.2f m, 设定vz=%.2f m/s, rel_climb=%.2f m", elapsed, vx_forward * elapsed, buffer_vz_, rel_climb);
+            if (buffer_hover_sec_ > 1e-3) {
+                enter_phase(TestPhase::HOVER_AFTER_BUFFER, now);
+            } else {
+                if (!path_loaded_) {
+                    if (!load_path_from_csv(current_pos)) {
+                        ROS_ERROR("路径加载失败，进入FINISH悬停。");
+                        enter_phase(TestPhase::FINISH, now);
+                        break;
+                    }
+                }
+                publish_desired_path_once();
+                enter_phase(TestPhase::FOLLOW_PATH, now);
+            }
+        }
+        break;
+    }
+    case TestPhase::HOVER_AFTER_BUFFER:
+        if (elapsed >= buffer_hover_sec_) {
+            if (!path_loaded_) {
+                if (!load_path_from_csv(current_pos)) {
+                    ROS_ERROR("路径加载失败，进入FINISH悬停。");
+                    enter_phase(TestPhase::FINISH, now);
+                    break;
+                }
+            }
+            publish_desired_path_once();
+            enter_phase(TestPhase::FOLLOW_PATH, now);
+        }
+        break;
+    case TestPhase::FOLLOW_PATH: {
+        if (!has_gps) {
+            ROS_WARN_THROTTLE(1.0, "FOLLOW_PATH等待GPS初始化。");
+            break;
+        }
+        bool finished = false;
+        path_follow_step(vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd, finished);
+        if (finished) {
+            enter_phase(TestPhase::FINISH, now);
+        }
+        break;
+    }
+    case TestPhase::MOVE_FORWARD:
+    case TestPhase::MOVE_BACKWARD:
+    case TestPhase::MOVE_RIGHT:
+    case TestPhase::MOVE_LEFT:
+    case TestPhase::YAW_CW:
+    case TestPhase::YAW_CCW:
+        // 历史测试阶段保留占位，不再使用
+        break;
+    case TestPhase::FINISH:
+        break;
+    default:
+        break;
+    }
+
+    publish_velocity_cmd(vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd, 0);
+    ROS_INFO_THROTTLE(0.5,
+        "phase=%s cmd(vx,vy,vz,yawRate)=(%.2f,%.2f,%.2f,%.2f) pos=(%.2f,%.2f,%.2f) quat=(%.4f,%.4f,%.4f,%.4f)",
+        phase_name(phase), vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd,
+        current_pos.x(), current_pos.y(), current_pos.z(),
+        current_quat.x(), current_quat.y(), current_quat.z(), current_quat.w());
+}
+
+void BasicDev::pose_cb(const geometry_msgs::PoseStamped::ConstPtr& msg)
+{
+    const Eigen::Quaterniond q_raw(msg->pose.orientation.w, msg->pose.orientation.x, msg->pose.orientation.y, msg->pose.orientation.z);
+    if (pose_gt_is_ned_) {
+        // pose_gt按NED解释：z向下为正，因此内部z-up时需要z取反并转换四元数
+        current_quat = quat_ned_to_zup(q_raw);
+        current_pos = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, -msg->pose.position.z);
+    } else {
+        // pose_gt已是内部坐标定义，直接使用
+        current_quat = q_raw.normalized();
+        current_pos = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, msg->pose.position.z);
+    }
+    has_gps = true;  // 复用原状态变量，不改后续控制逻辑
+
+    const Eigen::Vector3d eulerAngle = current_quat.toRotationMatrix().eulerAngles(2, 1, 0);
+    constexpr double kPi = 3.14159265358979323846;
+    ROS_INFO_THROTTLE(0.2,
+        "POSE_GT(%s) t=%.3f pos=(%.3f, %.3f, %.3f) quat=(%.5f, %.5f, %.5f, %.5f) yaw=%.1f deg",
+        pose_gt_is_ned_ ? "NED->ZUP" : "DIRECT",
+        msg->header.stamp.sec + msg->header.stamp.nsec*1e-9,
+        current_pos.x(), current_pos.y(), current_pos.z(),
+        current_quat.x(), current_quat.y(), current_quat.z(), current_quat.w(),
+        eulerAngle[0] * 180.0 / kPi);
+}
+
+void BasicDev::gps_cb(const geometry_msgs::PoseStamped::ConstPtr& msg)
+{
+    const Eigen::Quaterniond q_ned(msg->pose.orientation.w, msg->pose.orientation.x, msg->pose.orientation.y, msg->pose.orientation.z);
+    const Eigen::Quaterniond q = quat_ned_to_zup(q_ned);
+    const Eigen::Vector3d eulerAngle = q.toRotationMatrix().eulerAngles(2, 1, 0);
+    const Eigen::Vector3d p(msg->pose.position.x, msg->pose.position.y, -msg->pose.position.z);
+    // 将控制状态切换为 GPS（NED->ZUP）
+    current_quat = q;
+    current_pos = p;
+    has_gps = true;
+    constexpr double kPi = 3.14159265358979323846;
+    ROS_INFO_THROTTLE(0.2,
+        "GPS(raw) t=%.3f pos=(%.3f, %.3f, %.3f) quat=(%.5f, %.5f, %.5f, %.5f) yaw=%.1f deg",
+        msg->header.stamp.sec + msg->header.stamp.nsec*1e-9,
+        p.x(), p.y(), p.z(),
+        q.x(), q.y(), q.z(), q.w(),
+        eulerAngle[0] * 180.0 / kPi);
+}
+
+void BasicDev::imu_cb(const sensor_msgs::Imu::ConstPtr& msg)
+{
+    ROS_INFO_THROTTLE(1.0, "Get imu data. time: %f", msg->header.stamp.sec + msg->header.stamp.nsec*1e-9);
+}
+
+void BasicDev::front_left_view_cb(const sensor_msgs::ImageConstPtr& msg)
+{
+    cv_front_left_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_8UC3);
+    if(!cv_front_left_ptr->image.empty())
+    {
+        ROS_INFO_THROTTLE(1.0, "Get front left image.: %f", msg->header.stamp.sec + msg->header.stamp.nsec*1e-9);
+    }
+}
+
+void BasicDev::front_right_view_cb(const sensor_msgs::ImageConstPtr& msg)
+{
+    cv_front_right_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_8UC3);
+    if(!cv_front_right_ptr->image.empty())
+    {
+        ROS_INFO_THROTTLE(1.0, "Get front right image.%f", msg->header.stamp.sec + msg->header.stamp.nsec*1e-9);
+    }
+}
+
+void BasicDev::back_left_view_cb(const sensor_msgs::ImageConstPtr& msg)
+{
+    cv_back_left_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_8UC3);
+    if(!cv_back_left_ptr->image.empty())
+    {
+        ROS_INFO_THROTTLE(1.0, "Get back left image.: %f", msg->header.stamp.sec + msg->header.stamp.nsec*1e-9);
+    }
+}
+
+void BasicDev::back_right_view_cb(const sensor_msgs::ImageConstPtr& msg)
+{
+    cv_back_right_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::TYPE_8UC3);
+    if(!cv_back_right_ptr->image.empty())
+    {
+        ROS_INFO_THROTTLE(1.0, "Get back right image.: %f", msg->header.stamp.sec + msg->header.stamp.nsec*1e-9);
+    }
+}
+
+void BasicDev::lidar_cb(const sensor_msgs::PointCloud2::ConstPtr& msg)
+{
+    pcl::PointCloud<pcl::PointXYZ>::Ptr pts(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl::fromROSMsg(*msg, *pts);
+    ROS_INFO_THROTTLE(1.0, "Get lidar data. time: %f, size: %ld", msg->header.stamp.sec + msg->header.stamp.nsec*1e-9, pts->size());
+
+    if (!corridor_enable_ || !has_gps || !corridor_cloud_ || corridor_voxel_leaf_ <= 1e-6) {
+        return;
+    }
+
+    const Eigen::Quaterniond q_wb = current_quat.normalized();
+    const Eigen::Vector3d t_w = current_pos;
+    const double leaf = corridor_voxel_leaf_;
+    const double min_r = std::max(0.0, corridor_min_range_);
+    const double max_r = std::max(min_r + 0.1, corridor_max_range_);
+
+    for (const auto& p : pts->points) {
+        if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
+
+        // Lidar原始点默认z-down，内部统一z-up
+        const Eigen::Vector3d p_b(p.x, p.y, -p.z);
+        const double r = p_b.norm();
+        if (r < min_r || r > max_r) continue;
+
+        const Eigen::Vector3d p_w = t_w + q_wb * p_b;
+        const int ix = static_cast<int>(std::floor(p_w.x() / leaf));
+        const int iy = static_cast<int>(std::floor(p_w.y() / leaf));
+        const int iz = static_cast<int>(std::floor(p_w.z() / leaf));
+        const long long key = pack_voxel_key(ix, iy, iz);
+
+        if (corridor_voxel_keys_.find(key) != corridor_voxel_keys_.end()) continue;
+        if (corridor_cloud_->points.size() >= corridor_max_points_) continue;
+
+        corridor_voxel_keys_.insert(key);
+        pcl::PointXYZ pw;
+        pw.x = static_cast<float>(p_w.x());
+        pw.y = static_cast<float>(p_w.y());
+        pw.z = static_cast<float>(p_w.z());
+        corridor_cloud_->points.push_back(pw);
+    }
+
+    const ros::Time now = msg->header.stamp.isZero() ? ros::Time::now() : msg->header.stamp;
+    const double min_pub_period = 1.0 / std::max(0.1, corridor_pub_hz_);
+    if (last_corridor_pub_time_.isZero() || (now - last_corridor_pub_time_).toSec() >= min_pub_period) {
+        sensor_msgs::PointCloud2 map_msg;
+        pcl::toROSMsg(*corridor_cloud_, map_msg);
+        map_msg.header.stamp = now;
+        map_msg.header.frame_id = viz_frame_id_;
+        corridor_map_pub_.publish(map_msg);
+        last_corridor_pub_time_ = now;
+        ROS_INFO_THROTTLE(1.0, "Corridor map points: %zu", corridor_cloud_->points.size());
+    }
+}
+
+void BasicDev::pwm_feedback_cb(const airsim_ros::RotorPWM::ConstPtr& msg)
+{
+    ROS_INFO_THROTTLE(1.0, "Get rotor pwm feedback. %f %f %f %f", msg->rotorPWM0, msg->rotorPWM1, msg->rotorPWM2, msg->rotorPWM3);
+}
+
+void BasicDev::initial_pose_cb(const geometry_msgs::PoseStamped::ConstPtr& msg)
+{
+    init_pos = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, -msg->pose.position.z);
+    has_init_pose = true;
+    ROS_INFO("Get initial pose. time: %f, posi: %f, %f, %f", msg->header.stamp.sec + msg->header.stamp.nsec*1e-9,
+        msg->pose.position.x, msg->pose.position.y, -msg->pose.position.z);
+}
+
+void BasicDev::end_goal_cb(const geometry_msgs::PoseStamped::ConstPtr& msg)
+{
+    // 内部统一 z-up 坐标
+    goal_pos = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y, -msg->pose.position.z);
+    ROS_INFO("Get end goal. time: %f, goal_pos: %f, %f, %f",
+        msg->header.stamp.sec + msg->header.stamp.nsec*1e-9,
+        goal_pos.x(), goal_pos.y(), goal_pos.z());
+    ROS_INFO("goal_orientation: x=%f y=%f z=%f w=%f",
+        msg->pose.orientation.x, msg->pose.orientation.y, msg->pose.orientation.z, msg->pose.orientation.w);
+}
+
+#endif
