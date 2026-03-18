@@ -1,0 +1,170 @@
+#include "camera_manager.h"
+//应用程序的核心框架
+#include "application.hpp"
+//PSDK的日志模块
+#include "dji_logger.h"
+//获取无人机的基本信息
+#include "dji_aircraft_info.h"
+//C标准头文件 捕获信号后实现平稳退出
+#include "signal.h"
+//PSDK 头文件
+#include "dji_platform.h"
+//云台管理头文件
+#include "gimbal_manager.h"
+#include "dji_power_management.h"
+//电压管理的头文件
+
+int main(int argc, char **argv)
+{
+    //创建signal，以便安全退出
+    signal(SIGINT, [](int signalNum) -> void { exit(0); });
+    //进行系统初始化
+    Application application(argc, argv);
+    //创建系统句柄
+    T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
+    //创建返回错误代码
+    T_DjiReturnCode returnCode;
+    //创建相机类型
+    E_DjiCameraType cameraType;
+    //创建固件类型
+    T_DjiCameraManagerFirmwareVersion firmwareVersion;
+    //创建对焦点
+    T_DjiCameraManagerFocusPosData focusPosData;
+    //创建变焦数据
+    T_DjiCameraManagerTapZoomPosData tapZoomPosData;
+    //创建相机位置
+    E_DjiMountPosition mountPosition = DJI_MOUNT_POSITION_PAYLOAD_PORT_NO1;
+
+    // 1. 定义变量
+    T_DjiCameraManagerFocusPosData focusPoint;
+
+    E_DjiCameraZoomDirection zoomDirection;
+
+    E_DjiCameraZoomSpeed zoomSpeed;
+
+    E_DjiCameraManagerStreamSource camerasource;
+    //云台工作模式
+    E_DjiGimbalMode gimbalMode;
+    //云台旋转模式
+    T_DjiGimbalManagerRotation rotation;
+
+    //数据订阅相关内容
+    //云台角度
+    T_DjiFcSubscriptionGimbalAngles gimbalAngles = {0};
+    //时间戳
+    T_DjiDataTimestamp angle_timestamp = {0};
+    //云台状态
+    T_DjiFcSubscriptionGimbalStatus gimbalStatus = {0};
+    //时间戳
+    T_DjiDataTimestamp status_timestamp = {0};
+
+    camerasource = DJI_CAMERA_MANAGER_SOURCE_ZOOM_CAM;
+
+    dji_f32_t factor;
+
+    factor = 10.0f;
+    // 2. 赋值：设置在画面正中心
+    focusPoint.focusX = 0.5f;
+    focusPoint.focusY = 0.5f;
+    // 设置变焦方向
+    zoomDirection = DJI_CAMERA_ZOOM_DIRECTION_IN;
+
+    // 设置云台旋转模式
+    gimbalMode = DJI_GIMBAL_MODE_FREE;
+
+    // 设置云台旋转参数
+    rotation.rotationMode = DJI_GIMBAL_ROTATION_MODE_RELATIVE_ANGLE;
+    rotation.pitch = 0.0f;
+    rotation.roll = 0.0f;
+    rotation.yaw = 100.0f;
+
+    //无人机基础Info订阅
+    T_DjiAircraftInfoBaseInfo baseInfo;
+    returnCode = DjiAircraftInfo_GetBaseInfo(&baseInfo);
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("Failed to get aircraft base info, return code 0x%08X", returnCode);
+        goto exitCameraModule;
+    }
+
+    
+
+    //Step1:初始化相机
+    USER_LOG_INFO("--> Step 1: Init camera manager module");
+    returnCode = DjiCameraManager_Init();
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("Init camera manager failed, error code: 0x%08X\r\n", returnCode);
+        goto exitCameraModule;
+    }
+    //Step2:获取相机类型和版本
+    USER_LOG_INFO("--> Step 2: Get camera type and version");
+    returnCode = DjiCameraManager_GetCameraType(mountPosition, &cameraType);
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("Get mounted position %d camera's type failed, error code: 0x%08X\r\n",
+                       mountPosition, returnCode);
+        goto exitCameraModule;
+    }
+
+    returnCode = DjiCameraManager_GetFirmwareVersion(mountPosition, &firmwareVersion);
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("Get mounted position %d camera's firmware version failed, error code: 0x%08X\r\n",
+                       mountPosition, returnCode);
+        goto exitCameraModule;
+    }
+    USER_LOG_INFO("Mounted position %d camera's firmware is V%02d.%02d.%02d.%02d\r\n", mountPosition,
+                firmwareVersion.firmware_version[0], firmwareVersion.firmware_version[1],
+                firmwareVersion.firmware_version[2], firmwareVersion.firmware_version[3]);
+
+    //  Step 1:云台初始化
+    USER_LOG_INFO("--> Step 1: Init gimbal manager module");
+    returnCode = DjiGimbalManager_Init();
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("Init gimbal manager failed, error code: 0x%08X", returnCode);
+        goto exitCameraModule;
+    }
+    //  Step 2:云台设置为自由运动模式
+    USER_LOG_INFO("--> Step 2: Set gimbal to free mode");
+    returnCode = DjiGimbalManager_SetMode(mountPosition, gimbalMode);
+    //  Step 3:重置云台角度
+    USER_LOG_INFO("--> Step 3: Reset gimbal angles.\r\n");
+    returnCode = DjiGimbalManager_Reset(mountPosition, DJI_GIMBAL_RESET_MODE_PITCH_AND_YAW);
+    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+        USER_LOG_ERROR("Reset gimbal failed, error code: 0x%08X", returnCode);
+    }
+
+    // 云台状态订阅设置
+    USER_LOG_INFO("--> Step 1: Init data subscribation");
+    DjiFcSubscription_Init();
+    // 利用函数将数据获取到指定空间
+    MY_SubGimbalAngle();
+
+    osalHandler->TaskSleepMs(2000);
+
+    while(1)
+    {
+        MY_DataSubGimbalAngle((uint8_t *) &gimbalAngles,&angle_timestamp);
+
+        USER_LOG_INFO("gimbal angle :%f,%f,%f",gimbalAngles.x,gimbalAngles.y,gimbalAngles.z);
+
+        osalHandler->TaskSleepMs(100);
+    }
+    MY_GimbalRotate(mountPosition,rotation);
+    // MY_CameraSourceSet(mountPosition,camerasource);
+    
+    // MY_CameraAllDirectionOpticalZoom(mountPosition,factor);
+
+    // MY_CameraManagerStartShootSinglePhoto(mountPosition);
+
+
+    exitCameraModule:
+        //相机反初始化
+        returnCode = DjiCameraManager_DeInit();
+        if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            USER_LOG_ERROR("Camera manager deinit failed ,error code :0x%08X", returnCode);
+        }
+        //云台反初始化
+        returnCode = DjiGimbalManager_Deinit();
+        if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+            USER_LOG_ERROR("Camera manager deinit failed ,error code :0x%08X", returnCode);
+        }
+        return returnCode;
+}
