@@ -351,6 +351,10 @@ private:
     int stage2_debug_blockage_occupied_bins_ = 0;
     double stage2_debug_best_candidate_clearance_ = std::numeric_limits<double>::infinity();
     double stage2_debug_best_gap_width_ = 0.0;
+    // [METRIC] 候选可行率埋点：可行候选数 / 候选窗口总数；fallback 标志
+    int stage2_debug_feasible_candidates_ = 0;
+    int stage2_debug_total_candidates_ = 0;
+    bool stage2_debug_fallback_used_ = false;
     bool stage2_cmd_inited_ = false;
     double stage2_prev_vy_cmd_ = 0.0;
     double stage2_prev_vz_cmd_ = 0.0;

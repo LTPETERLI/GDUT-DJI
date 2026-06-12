@@ -1345,6 +1345,7 @@ bool BasicDev::compute_stage2_avoid_target(const Eigen::Vector3d& raw_target,
 
     std::vector<Stage2CandidateCell> candidates;
     candidates.reserve(static_cast<size_t>(grid.pitch_bins * grid.yaw_bins));
+    int dbg_window_cells = 0;  // [METRIC] 落在目标扇区+pitch限内的候选窗口总数
     for (int pidx = 0; pidx < grid.pitch_bins; ++pidx) {
         const double pitch_center = grid.pitch_min +
             (static_cast<double>(pidx) + 0.5) * pitch_step;
@@ -1353,11 +1354,16 @@ bool BasicDev::compute_stage2_avoid_target(const Eigen::Vector3d& raw_target,
                 (static_cast<double>(yidx) + 0.5) * yaw_step;
             if (yaw_center < goal_yaw - max_deflect || yaw_center > goal_yaw + max_deflect) continue;
             if (std::fabs(pitch_center) > candidate_pitch_limit) continue;
+            ++dbg_window_cells;
             const float cost = total_cost(pidx, yidx);
             if (!std::isfinite(cost) || cost >= 1e4f) continue;
             candidates.push_back(Stage2CandidateCell{static_cast<double>(cost), pidx, yidx});
         }
     }
+    // [METRIC] 记录候选可行率（供 STAGE2_PATH 日志输出）
+    stage2_debug_feasible_candidates_ = static_cast<int>(candidates.size());
+    stage2_debug_total_candidates_ = dbg_window_cells;
+    stage2_debug_fallback_used_ = false;
     std::sort(candidates.begin(), candidates.end(),
               [](const Stage2CandidateCell& a, const Stage2CandidateCell& b) { return a.cost < b.cost; });
 
@@ -1434,6 +1440,7 @@ bool BasicDev::compute_stage2_avoid_target(const Eigen::Vector3d& raw_target,
                                                             raw_target_b.y() + avoid_offset,
                                                             raw_target_b.z());
         stage2_debug_selected_candidate_ = -2;
+        stage2_debug_fallback_used_ = true;
         stage2_debug_best_candidate_clearance_ = std::min(stage2_debug_best_candidate_clearance_, nearest_center_range);
         stage2_debug_best_gap_width_ = 0.0;
         return true;
@@ -2434,6 +2441,19 @@ void BasicDev::stage2_follow_step(double& vx, double& vy, double& vz, double& ya
     const double dist_end = (path_pts_.back() - current_pos).norm();
     const double stage2_avoid_scale = 1.0;
 
+    // [METRIC] 横向偏离中心线：current_pos 到最近路径段的水平垂距（对应"被吸下去"前兆）
+    double centerline_dev = 0.0;
+    {
+        const size_t seg_a = i_near;
+        const size_t seg_b = std::min(path_pts_.size() - 1, i_near + 1);
+        Eigen::Vector3d p_flat = current_pos;        p_flat.z() = 0.0;
+        Eigen::Vector3d a_flat = path_pts_[seg_a];   a_flat.z() = 0.0;
+        Eigen::Vector3d b_flat = path_pts_[seg_b];   b_flat.z() = 0.0;
+        centerline_dev = (seg_b > seg_a)
+            ? point_to_segment_distance(p_flat, a_flat, b_flat)
+            : (p_flat - a_flat).norm();
+    }
+
     const double dt_cmd = clampd(dt, 0.01, 0.10);
     const double vy_slew_rate =
         dynamic_fast_avoid ? stage2_dynamic_avoid_vy_slew_rate_ : stage2_avoid_vy_slew_rate_;
@@ -2462,11 +2482,13 @@ void BasicDev::stage2_follow_step(double& vx, double& vy, double& vz, double& ya
     if (stage2_mode_ == Stage2FollowMode::CRUISE && !stage2_avoid_latched_ &&
         dist_end < final_stop_before_end_dist_) finished = true;
 
-    ROS_INFO_THROTTLE(0.5, "[STAGE2_PATH] mode=%s near=%zu tar=%zu tar_z=%zu L=%.2f vh=%.2f yaw_err=%.1f dz=%.2f zblend=%.2f obs=%.2f trigger=%.2f trig=%d trig_n=%d ztrig=%d head=%.2f foot=%.2f body=%.2f close=%d pts=%d dens=%.2f bins=%d gap=%d best=%.2f gapw=%.2f closing=%.2f ttc=%.2f latched=%d dyn=%d cmd=(%.2f %.2f %.2f %.1f) lim(vy,vz)=(%.2f,%.2f)",
+    ROS_INFO_THROTTLE(0.5, "[STAGE2_PATH] mode=%s near=%zu tar=%zu tar_z=%zu L=%.2f vh=%.2f yaw_err=%.1f dz=%.2f zblend=%.2f obs=%.2f trigger=%.2f trig=%d trig_n=%d ztrig=%d head=%.2f foot=%.2f body=%.2f close=%d pts=%d dens=%.2f bins=%d gap=%d best=%.2f gapw=%.2f closing=%.2f ttc=%.2f latched=%d dyn=%d cdev=%.2f feas=%d tot=%d fb=%d cmd=(%.2f %.2f %.2f %.1f) lim(vy,vz)=(%.2f,%.2f)",
                       stage2_mode_name(stage2_mode_), i_near, i_tar, i_tar_z, lookahead_now, horiz_speed, yaw_err_deg, dz_w,
                       stage2_z_blend_alpha, stage2_obs_dist, stage2_avoid_trigger_dist_, static_cast<int>(stage2_triggered), stage2_triggered_streak_, static_cast<int>(stage2_z_avoid_active), overhead_min, underside_min, body_proximity_min, static_cast<int>(close_quarters_escape), stage2_debug_blockage_points_, stage2_debug_blockage_density_, stage2_debug_blockage_occupied_bins_,
                       static_cast<int>(have_avoid_target), stage2_debug_best_candidate_clearance_, stage2_debug_best_gap_width_,
                       closing_speed, ttc, static_cast<int>(stage2_avoid_latched_), static_cast<int>(dynamic_fast_avoid),
+                      centerline_dev,
+                      stage2_debug_feasible_candidates_, stage2_debug_total_candidates_, static_cast<int>(stage2_debug_fallback_used_),
                       vx, vy, vz, yaw_deg, stage2_vy_limit_now, stage2_vz_limit_now);
 }
 
@@ -2613,6 +2635,21 @@ void BasicDev::publish_velocity_cmd(double vx, double vy, double vz, double yaw_
 void BasicDev::control_timer_cb(const ros::TimerEvent& event)
 {
     (void)event;
+    // [PERF] 控制环耗时与帧率埋点（纯观测，不改控制逻辑）
+    const ros::WallTime perf_loop_start = ros::WallTime::now();
+    static ros::WallTime perf_prev_start;
+    static bool perf_inited = false;
+    static double perf_fps_filt = 0.0;       // 滑动平均帧率(Hz)
+    static double perf_cb_ms_filt = 0.0;     // 滑动平均单帧耗时(ms)
+    double perf_interval_ms = 0.0;
+    if (perf_inited) {
+        perf_interval_ms = (perf_loop_start - perf_prev_start).toSec() * 1000.0;
+        const double inst_fps = (perf_interval_ms > 1e-3) ? (1000.0 / perf_interval_ms) : 0.0;
+        perf_fps_filt = (perf_fps_filt <= 0.0) ? inst_fps : (0.9 * perf_fps_filt + 0.1 * inst_fps);
+    }
+    perf_prev_start = perf_loop_start;
+    perf_inited = true;
+
     const ros::Time now = ros::Time::now();
     update_and_publish_actual_path();
     publish_follow_tf();
@@ -2802,6 +2839,12 @@ void BasicDev::control_timer_cb(const ros::TimerEvent& event)
     if (publish_cmd) {
         publish_velocity_cmd(vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd, 0);
     }
+    // [PERF] 出口计算本帧耗时，输出帧率指标
+    const double perf_cb_ms = (ros::WallTime::now() - perf_loop_start).toSec() * 1000.0;
+    perf_cb_ms_filt = (perf_cb_ms_filt <= 0.0) ? perf_cb_ms : (0.9 * perf_cb_ms_filt + 0.1 * perf_cb_ms);
+    ROS_INFO_THROTTLE(0.5,
+        "[PERF] cb_ms=%.2f cb_ms_avg=%.2f interval_ms=%.2f fps_avg=%.2f",
+        perf_cb_ms, perf_cb_ms_filt, perf_interval_ms, perf_fps_filt);
     ROS_INFO_THROTTLE(0.5,
         "phase=%s cmd(vx,vy,vz,yawRate)=(%.2f,%.2f,%.2f,%.2f) pos=(%.2f,%.2f,%.2f) quat=(%.4f,%.4f,%.4f,%.4f)",
         phase_name(phase), vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd,
