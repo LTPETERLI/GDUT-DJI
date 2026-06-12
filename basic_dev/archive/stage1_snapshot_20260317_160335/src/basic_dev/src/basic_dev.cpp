@@ -243,6 +243,10 @@ BasicDev::BasicDev(ros::NodeHandle *nh)
     nh->param("stage2_avoid_forward_range", stage2_avoid_forward_range_, 12.0); // 第二赛段前向检测距离（m）
     nh->param("stage2_avoid_lateral_half_width", stage2_avoid_lateral_half_width_, 1.8); // 第二赛段前向检测横向半宽（m）
     nh->param("stage2_avoid_vertical_half_height", stage2_avoid_vertical_half_height_, 1.6); // 第二赛段前向检测竖向半高（m）
+    // [P0-A 撞顶标牌] 头顶感知+下压参数
+    nh->param("stage2_overhead_forward_range", stage2_overhead_forward_range_, 6.0);
+    nh->param("stage2_overhead_clear_height", stage2_overhead_clear_height_, 1.0);
+    nh->param("stage2_overhead_duck_vz", stage2_overhead_duck_vz_, 4.0);
     nh->param("stage2_avoid_center_half_width", stage2_avoid_center_half_width_, 0.9); // 第二赛段中心阻塞检测半宽（m）
     nh->param("stage2_avoid_side_probe_width", stage2_avoid_side_probe_width_, 2.5); // 第二赛段左右探测宽度（m）
     nh->param("stage2_avoid_max_lateral_offset", stage2_avoid_max_lateral_offset_, 2.0); // 第二赛段最大横向绕障偏置（m）
@@ -2042,12 +2046,16 @@ void BasicDev::stage2_follow_step(double& vx, double& vy, double& vz, double& ya
         const double forward_band = std::max(0.8, 1.5 * stage2_vehicle_safe_width_);
         const double vertical_band = std::max(0.30, 0.8 * stage2_vehicle_safe_height_);
         const double body_eval_radius = std::max(0.8, 1.8 * stage2_vehicle_safe_width_);
+        // [P0-A] 头顶障碍单独用更大的前向范围扫描(原forward_band~1m太近,标牌贴顶才发现)
+        const double overhead_fwd = std::max(forward_band, stage2_overhead_forward_range_);
         for (const auto& p : stage2_frame_cloud_body_->points) {
             const double abs_y = std::fabs(p.y);
+            // 头顶障碍：前向放大到 overhead_fwd，只要在机体上方且横向在机身宽度内
+            if (p.x >= -0.2 && p.x <= overhead_fwd && abs_y <= lateral_band && p.z > vertical_band) {
+                overhead_min = std::min(overhead_min, static_cast<double>(p.z));
+            }
             if (p.x >= -0.2 && p.x <= forward_band && abs_y <= lateral_band) {
-                if (p.z > vertical_band) {
-                    overhead_min = std::min(overhead_min, static_cast<double>(p.z));
-                } else if (p.z < -vertical_band) {
+                if (p.z < -vertical_band) {
                     underside_min = std::min(underside_min, static_cast<double>(-p.z));
                 }
             }
@@ -2513,6 +2521,19 @@ void BasicDev::stage2_follow_step(double& vx, double& vy, double& vz, double& ya
                     stage2_prev_vz_cmd_ + max_dvz);
         stage2_prev_vy_cmd_ = vy;
         stage2_prev_vz_cmd_ = vz;
+    }
+
+    // [P0-A 撞顶标牌] 头顶障碍主动下压(slew之后的安全兜底,不受变化率限制,需即时下扎)
+    // 原逻辑头顶有障碍只z_hold保持高度→照撞标牌。这里检测到头顶净空不足时强制下压。
+    if (std::isfinite(overhead_min) && overhead_min < stage2_overhead_clear_height_) {
+        const double duck_ratio = clampd(
+            (stage2_overhead_clear_height_ - overhead_min) / std::max(0.1, stage2_overhead_clear_height_),
+            0.0, 1.0);
+        const double duck_vz = -std::max(0.0, stage2_overhead_duck_vz_) * duck_ratio;  // z-up:负=下压
+        if (duck_vz < vz) {  // 取更强下压
+            vz = clampd(duck_vz, -stage2_vz_limit_now, stage2_vz_limit_now);
+            stage2_prev_vz_cmd_ = vz;
+        }
     }
 
     publish_stage2_obstacle_points();

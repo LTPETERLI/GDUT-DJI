@@ -294,6 +294,10 @@ private:
     double stage2_avoid_forward_range_ = 12.0;
     double stage2_avoid_lateral_half_width_ = 1.8;
     double stage2_avoid_vertical_half_height_ = 1.6;
+    // [P0-A 撞顶标牌] 头顶障碍前向感知范围 + 主动下压
+    double stage2_overhead_forward_range_ = 6.0;  // 头顶障碍检测的前向距离(m),原来只有~1m太近
+    double stage2_overhead_clear_height_ = 1.0;   // 头顶安全余量,小于此值触发下压(m)
+    double stage2_overhead_duck_vz_ = 4.0;        // 检测到头顶障碍时的主动下压速度(m/s)
     double stage2_avoid_center_half_width_ = 0.9;
     double stage2_avoid_side_probe_width_ = 2.5;
     double stage2_avoid_max_lateral_offset_ = 2.0;
