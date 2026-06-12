@@ -273,6 +273,9 @@ BasicDev::BasicDev(ros::NodeHandle *nh)
     nh->param("stage2_corridor_pull_gain", stage2_corridor_pull_gain_, 1.5);
     nh->param("stage2_corridor_pull_max_vy", stage2_corridor_pull_max_vy_, 6.0);
     nh->param("stage2_corridor_hard_vx_scale", stage2_corridor_hard_vx_scale_, 0.4);
+    // [B2 垂直边界]
+    nh->param("stage2_corridor_pull_max_vz", stage2_corridor_pull_max_vz_, 8.0);
+    nh->param("stage2_vbound_soft_ratio", stage2_vbound_soft_ratio_, 0.6);
     nh->param("stage2_vehicle_width", stage2_vehicle_width_, 0.40); // 无人机宽度（m）
     nh->param("stage2_vehicle_height", stage2_vehicle_height_, 0.30); // 无人机高度（m）
     nh->param("stage2_vehicle_clearance", stage2_vehicle_clearance_, 0.15); // 无人机穿缝时的单侧安全余量（m）
@@ -2343,39 +2346,7 @@ void BasicDev::stage2_follow_step(double& vx, double& vy, double& vz, double& ya
         }
     }
 
-    // [P0-边界约束] 横向回拉：基于"当前位置偏离中心线"的硬约束，防止避障时冲出赛道。
-    // 关键：之前的 avoid_offset 只约束目标点偏移，不约束实际位置；这里补上基于 current_pos 的反馈。
-    {
-        const size_t seg_a = i_near;
-        const size_t seg_b = std::min(path_pts_.size() - 1, i_near + 1);
-        Eigen::Vector3d tan_w = (seg_b > seg_a) ? Eigen::Vector3d(path_pts_[seg_b] - path_pts_[seg_a])
-                                                 : Eigen::Vector3d(Eigen::Vector3d::UnitX());
-        tan_w.z() = 0.0;
-        if (tan_w.head<2>().norm() < 1e-3) tan_w = Eigen::Vector3d::UnitX(); else tan_w.normalize();
-        // 中心线左法向(世界系)
-        Eigen::Vector3d nrm_w(-tan_w.y(), tan_w.x(), 0.0);
-        Eigen::Vector3d err_w = current_pos - path_pts_[seg_a];
-        err_w.z() = 0.0;
-        const double signed_dev = err_w.dot(nrm_w);          // 带符号横向偏离(+左 -右)
-        const double abs_dev = std::fabs(signed_dev);
-        const double hard_lim = std::max(0.5, stage2_corridor_half_width_safe_);
-        const double soft_lim = clampd(stage2_corridor_pull_soft_ratio_, 0.1, 0.95) * hard_lim;
-        if (abs_dev > soft_lim) {
-            // 回拉强度随偏离二次增长，硬边界处饱和
-            const double over = clampd((abs_dev - soft_lim) / std::max(1e-3, hard_lim - soft_lim), 0.0, 1.0);
-            const double pull_mag = clampd(stage2_corridor_pull_gain_ * over * over * stage2_corridor_pull_max_vy_,
-                                           0.0, stage2_corridor_pull_max_vy_);
-            // 回拉方向：朝中心线(signed_dev>0在左侧→需朝右拉=-nrm_w)，转到机体系取y分量
-            const Eigen::Vector3d pull_dir_w = (signed_dev > 0.0 ? -nrm_w : nrm_w);
-            const double pull_vy_b = (R_wb.transpose() * pull_dir_w).y() * pull_mag;
-            vy = clampd(vy + pull_vy_b, -stage2_vy_limit_now, stage2_vy_limit_now);
-            vy_cmd_filt_ = vy;
-            // 趋硬边界时压低前向：宁可慢，不出界，留时间拉回
-            const double vx_scale = clampd(1.0 - (1.0 - stage2_corridor_hard_vx_scale_) * over,
-                                           stage2_corridor_hard_vx_scale_, 1.0);
-            vx *= vx_scale;
-        }
-    }
+    // [边界硬约束] 横向回拉已移至控制层最末(slew后)作为最高优先级硬钳制,见下方 B1/B2。
 
     const size_t i_tar_z = find_lookahead_index(i_near, std::max(0.0, z_lookahead_dist_));
     double z_target = path_pts_[i_tar_z].z();
@@ -2536,9 +2507,64 @@ void BasicDev::stage2_follow_step(double& vx, double& vy, double& vz, double& ya
         }
     }
 
+    // ========================================================================
+    // [B1+B2 边界硬约束] 最高优先级最终闸：赛道是长方体管道,出界即被10倍重力吸死。
+    // 放在所有避障/控制/slew之后,确保边界回拉能压过一切避障指令(seed123实测避障vy达9.4)。
+    // 横向+垂直对称处理,均基于"当前位置相对中心线的偏离"。
+    // ========================================================================
+    {
+        const size_t bnd_a = i_near;
+        const size_t bnd_b = std::min(path_pts_.size() - 1, i_near + 1);
+        Eigen::Vector3d tan_w = (bnd_b > bnd_a) ? Eigen::Vector3d(path_pts_[bnd_b] - path_pts_[bnd_a])
+                                                : Eigen::Vector3d(Eigen::Vector3d::UnitX());
+        tan_w.z() = 0.0;
+        if (tan_w.head<2>().norm() < 1e-3) tan_w = Eigen::Vector3d::UnitX(); else tan_w.normalize();
+        const Eigen::Vector3d nrm_w(-tan_w.y(), tan_w.x(), 0.0);  // 中心线左法向
+
+        // --- B1 横向边界 ---
+        Eigen::Vector3d err_w = current_pos - path_pts_[bnd_a];
+        const double signed_dev = Eigen::Vector3d(err_w.x(), err_w.y(), 0.0).dot(nrm_w);
+        const double abs_dev = std::fabs(signed_dev);
+        const double h_hard = std::max(0.5, stage2_corridor_half_width_safe_);
+        const double h_soft = clampd(stage2_corridor_pull_soft_ratio_, 0.1, 0.95) * h_hard;
+        if (abs_dev > h_soft) {
+            const double over = clampd((abs_dev - h_soft) / std::max(1e-3, h_hard - h_soft), 0.0, 1.0);
+            const double pull_mag = clampd(stage2_corridor_pull_gain_ * over * over * stage2_corridor_pull_max_vy_,
+                                           0.0, stage2_corridor_pull_max_vy_);
+            const Eigen::Vector3d pull_dir_w = (signed_dev > 0.0 ? -nrm_w : nrm_w);  // 朝中心线
+            const double pull_vy_b = (R_wb.transpose() * pull_dir_w).y() * pull_mag;
+            // 硬区直接覆盖(取朝心方向的更大值),软区叠加
+            vy = clampd(vy + pull_vy_b, -stage2_corridor_pull_max_vy_, stage2_corridor_pull_max_vy_);
+            stage2_prev_vy_cmd_ = vy;
+            const double vx_scale = clampd(1.0 - (1.0 - stage2_corridor_hard_vx_scale_) * over,
+                                           stage2_corridor_hard_vx_scale_, 1.0);
+            vx *= vx_scale;
+        }
+
+        // --- B2 垂直边界 (对称B1,治被吸下底面) ---
+        const double v_dev = current_pos.z() - path_pts_[bnd_a].z();  // +高于中心线 -低于
+        const double abs_vdev = std::fabs(v_dev);
+        const double v_hard = std::max(0.3, stage2_corridor_half_height_safe_);
+        const double v_soft = clampd(stage2_vbound_soft_ratio_, 0.1, 0.95) * v_hard;
+        if (abs_vdev > v_soft) {
+            const double over_v = clampd((abs_vdev - v_soft) / std::max(1e-3, v_hard - v_soft), 0.0, 1.0);
+            const double pull_vz_mag = clampd(stage2_corridor_pull_gain_ * over_v * over_v * stage2_corridor_pull_max_vz_,
+                                              0.0, stage2_corridor_pull_max_vz_);
+            // 低于中心线(v_dev<0,接近底面)→上拉(+vz); 高于→下压(-vz)
+            const double pull_vz = (v_dev < 0.0 ? pull_vz_mag : -pull_vz_mag);
+            // 硬区取更强的朝心修正,覆盖z-PID和头顶下压
+            if (v_dev < 0.0) {
+                vz = std::max(vz, pull_vz);   // 接近底面:至少要这么大的上拉
+            } else {
+                vz = std::min(vz, pull_vz);   // 接近顶面:至少要这么大的下压
+            }
+            vz = clampd(vz, -stage2_vz_limit_now, stage2_vz_limit_now);
+            stage2_prev_vz_cmd_ = vz;
+        }
+    }
+
     publish_stage2_obstacle_points();
     publish_stage2_debug_markers(p_tar_raw, p_tar, stage2_obs_dist, stage2_avoid_offset, stage2_avoid_scale);
-
     if (stage2_mode_ == Stage2FollowMode::CRUISE && !stage2_avoid_latched_ &&
         dist_end < final_stop_before_end_dist_) finished = true;
 

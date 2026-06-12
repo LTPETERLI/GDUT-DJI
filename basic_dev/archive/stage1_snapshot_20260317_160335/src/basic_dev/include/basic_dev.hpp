@@ -322,8 +322,11 @@ private:
     // [P0-边界约束] 横向回拉：偏离中心线超软阈值开始回拉，趋硬边界时回拉饱和+压低前向
     double stage2_corridor_pull_soft_ratio_ = 0.6;  // 软阈值 = corridor_half_width_safe * 此比例
     double stage2_corridor_pull_gain_ = 1.5;        // 回拉增益(越大拉得越急)
-    double stage2_corridor_pull_max_vy_ = 6.0;      // 回拉vy上限(m/s)
+    double stage2_corridor_pull_max_vy_ = 12.0;     // 回拉vy上限(m/s),需≥避障max_vy才能压过
     double stage2_corridor_hard_vx_scale_ = 0.4;    // 趋硬边界时前向vx压低到的最小比例
+    // [B2 垂直边界] 接近赛道上下边界时强力上拉/下压,防止被10倍重力场吸出管道
+    double stage2_corridor_pull_max_vz_ = 8.0;      // 垂直回拉vz上限(m/s)
+    double stage2_vbound_soft_ratio_ = 0.6;         // 垂直软阈值 = corridor_half_height_safe * 此比例
     double stage2_vehicle_width_ = 0.40;
     double stage2_vehicle_height_ = 0.30;
     double stage2_vehicle_clearance_ = 0.15;
