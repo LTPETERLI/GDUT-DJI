@@ -24,3 +24,12 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# 大文件：rosbag 与镜像tar/zip（不进版本控制，GitHub单文件100M上限）
+*.bag
+*.bag.active
+*.tar
+*.tar.gz
+*.zip
+basic_dev/src/basic_dev/bags/
+basic_dev/bags/

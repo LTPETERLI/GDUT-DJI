@@ -1,0 +1,13 @@
+version: '3'
+services:
+  roscore:
+    image: osrf/ros:noetic-desktop-full-focal
+    command: roscore
+    network_mode: host
+
+  basic_dev:
+    image: basic_dev_snapshot:latest
+    network_mode: host
+    depends_on:
+      - roscore
+    restart: unless-stopped
