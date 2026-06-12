@@ -315,6 +315,11 @@ private:
     double stage2_gap_width_weight_ = 1.2;
     double stage2_corridor_width_ = 10.0;
     double stage2_corridor_height_ = 5.0;
+    // [P0-边界约束] 横向回拉：偏离中心线超软阈值开始回拉，趋硬边界时回拉饱和+压低前向
+    double stage2_corridor_pull_soft_ratio_ = 0.6;  // 软阈值 = corridor_half_width_safe * 此比例
+    double stage2_corridor_pull_gain_ = 1.5;        // 回拉增益(越大拉得越急)
+    double stage2_corridor_pull_max_vy_ = 6.0;      // 回拉vy上限(m/s)
+    double stage2_corridor_hard_vx_scale_ = 0.4;    // 趋硬边界时前向vx压低到的最小比例
     double stage2_vehicle_width_ = 0.40;
     double stage2_vehicle_height_ = 0.30;
     double stage2_vehicle_clearance_ = 0.15;

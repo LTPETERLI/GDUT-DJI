@@ -264,6 +264,11 @@ BasicDev::BasicDev(ros::NodeHandle *nh)
     nh->param("stage2_gap_width_weight", stage2_gap_width_weight_, 1.2); // 第二赛段候选评分：缝隙宽度权重
     nh->param("stage2_corridor_width", stage2_corridor_width_, 10.0); // 第二赛段赛道通道宽度（m）
     nh->param("stage2_corridor_height", stage2_corridor_height_, 5.0); // 第二赛段赛道通道高度（m）
+    // [P0-边界约束] 横向回拉参数
+    nh->param("stage2_corridor_pull_soft_ratio", stage2_corridor_pull_soft_ratio_, 0.6);
+    nh->param("stage2_corridor_pull_gain", stage2_corridor_pull_gain_, 1.5);
+    nh->param("stage2_corridor_pull_max_vy", stage2_corridor_pull_max_vy_, 6.0);
+    nh->param("stage2_corridor_hard_vx_scale", stage2_corridor_hard_vx_scale_, 0.4);
     nh->param("stage2_vehicle_width", stage2_vehicle_width_, 0.40); // 无人机宽度（m）
     nh->param("stage2_vehicle_height", stage2_vehicle_height_, 0.30); // 无人机高度（m）
     nh->param("stage2_vehicle_clearance", stage2_vehicle_clearance_, 0.15); // 无人机穿缝时的单侧安全余量（m）
@@ -2327,6 +2332,40 @@ void BasicDev::stage2_follow_step(double& vx, double& vy, double& vz, double& ya
                 vy = std::copysign(min_avoid_vy, e_b.y());
                 vy_cmd_filt_ = vy;
             }
+        }
+    }
+
+    // [P0-边界约束] 横向回拉：基于"当前位置偏离中心线"的硬约束，防止避障时冲出赛道。
+    // 关键：之前的 avoid_offset 只约束目标点偏移，不约束实际位置；这里补上基于 current_pos 的反馈。
+    {
+        const size_t seg_a = i_near;
+        const size_t seg_b = std::min(path_pts_.size() - 1, i_near + 1);
+        Eigen::Vector3d tan_w = (seg_b > seg_a) ? Eigen::Vector3d(path_pts_[seg_b] - path_pts_[seg_a])
+                                                 : Eigen::Vector3d(Eigen::Vector3d::UnitX());
+        tan_w.z() = 0.0;
+        if (tan_w.head<2>().norm() < 1e-3) tan_w = Eigen::Vector3d::UnitX(); else tan_w.normalize();
+        // 中心线左法向(世界系)
+        Eigen::Vector3d nrm_w(-tan_w.y(), tan_w.x(), 0.0);
+        Eigen::Vector3d err_w = current_pos - path_pts_[seg_a];
+        err_w.z() = 0.0;
+        const double signed_dev = err_w.dot(nrm_w);          // 带符号横向偏离(+左 -右)
+        const double abs_dev = std::fabs(signed_dev);
+        const double hard_lim = std::max(0.5, stage2_corridor_half_width_safe_);
+        const double soft_lim = clampd(stage2_corridor_pull_soft_ratio_, 0.1, 0.95) * hard_lim;
+        if (abs_dev > soft_lim) {
+            // 回拉强度随偏离二次增长，硬边界处饱和
+            const double over = clampd((abs_dev - soft_lim) / std::max(1e-3, hard_lim - soft_lim), 0.0, 1.0);
+            const double pull_mag = clampd(stage2_corridor_pull_gain_ * over * over * stage2_corridor_pull_max_vy_,
+                                           0.0, stage2_corridor_pull_max_vy_);
+            // 回拉方向：朝中心线(signed_dev>0在左侧→需朝右拉=-nrm_w)，转到机体系取y分量
+            const Eigen::Vector3d pull_dir_w = (signed_dev > 0.0 ? -nrm_w : nrm_w);
+            const double pull_vy_b = (R_wb.transpose() * pull_dir_w).y() * pull_mag;
+            vy = clampd(vy + pull_vy_b, -stage2_vy_limit_now, stage2_vy_limit_now);
+            vy_cmd_filt_ = vy;
+            // 趋硬边界时压低前向：宁可慢，不出界，留时间拉回
+            const double vx_scale = clampd(1.0 - (1.0 - stage2_corridor_hard_vx_scale_) * over,
+                                           stage2_corridor_hard_vx_scale_, 1.0);
+            vx *= vx_scale;
         }
     }
 
