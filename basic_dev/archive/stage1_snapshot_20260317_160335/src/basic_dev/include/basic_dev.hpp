@@ -190,6 +190,8 @@ private:
     double final_turn_rate_limit_deg_ = 35.0; // 终点原地转向最大角速度（deg/s）
     double final_turn_tolerance_deg_ = 2.0; // 终点原地转向完成判定（deg）
     bool enable_stage2_ = true;
+    // [手飞交接] stage1轨迹终点切到人工接管(悬停+让出vel话题),用于键盘手飞后续
+    bool enable_manual_handover_at_end_ = false;
     bool stage2_invert_csv_y_ = false;
     bool use_relative_path_ = false;
     bool invert_csv_y_ = true;

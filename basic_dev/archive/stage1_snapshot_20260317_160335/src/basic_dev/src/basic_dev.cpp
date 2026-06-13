@@ -211,6 +211,7 @@ BasicDev::BasicDev(ros::NodeHandle *nh)
     nh->param("final_turn_rate_limit_deg", final_turn_rate_limit_deg_, 35.0); // 终点原地转向最大角速度（deg/s）
     nh->param("final_turn_tolerance_deg", final_turn_tolerance_deg_, 2.0); // 终点原地转向完成判定（deg）
     nh->param("enable_stage2", enable_stage2_, true);     // 掉头完成后是否切换到第二赛段
+    nh->param("enable_manual_handover_at_end", enable_manual_handover_at_end_, false); // stage1终点切人工接管(键盘手飞)
     nh->param("stage2_manual_takeover_enable", stage2_manual_takeover_enable_, false); // 掉头后是否停在人工接管等待阶段
     nh->param("stage2_invert_csv_y", stage2_invert_csv_y_, false); // 第二赛段CSV是否额外翻转Y
     nh->param("stage2_avoid_enable", stage2_avoid_enable_, true); // 第二赛段是否启用第一步前向避障
@@ -2853,7 +2854,14 @@ void BasicDev::control_timer_cb(const ros::TimerEvent& event)
         bool finished = false;
         stage2_follow_step(vx_cmd, vy_cmd, vz_cmd, yaw_rate_cmd, finished);
         if (finished) {
-            enter_phase(TestPhase::FINISH, now);
+            // [手飞交接] stage2参考航点跑完后,若开启则切人工接管(悬停+让出vel话题给键盘),
+            // 否则进FINISH悬停(原行为)。
+            if (enable_manual_handover_at_end_) {
+                ROS_INFO("Stage2航点已跑完,切换到人工接管(键盘手飞)。");
+                enter_phase(TestPhase::WAIT_STAGE2_MANUAL, now);
+            } else {
+                enter_phase(TestPhase::FINISH, now);
+            }
         }
         break;
     }

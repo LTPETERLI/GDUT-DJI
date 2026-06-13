@@ -45,8 +45,8 @@ include_directories(include ${catkin_INCLUDE_DIRS} ${OpenCV_INCLUDE_DIRS} ${X11_
 add_executable(basic_dev src/basic_dev.cpp )
 target_link_libraries(basic_dev ${catkin_LIBRARIES} ${OpenCV_LIBRARIES})
 
-# add_executable(kb_ctrl src/kb_ctrl.cpp)
-# target_link_libraries(kb_ctrl ${catkin_LIBRARIES} ${X11_LIBRARIES})
+add_executable(kb_ctrl src/kb_ctrl.cpp)
+target_link_libraries(kb_ctrl ${catkin_LIBRARIES} ${X11_LIBRARIES})
 
 install(DIRECTORY
   launch
@@ -59,5 +59,7 @@ catkin_install_python(
     scripts/yaw_tuner.py
     scripts/log_flight.py
     scripts/visualize_stage_paths.py
+    scripts/parse_stage2_log.py
+    scripts/record_waypoints.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
