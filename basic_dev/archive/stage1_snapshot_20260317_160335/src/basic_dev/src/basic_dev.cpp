@@ -1944,6 +1944,22 @@ void BasicDev::stage2_follow_step(double& vx, double& vy, double& vz, double& ya
     if (!path_loaded_ || path_pts_.size() < 2) return;
 
     const size_t i_near = find_nearest_index(current_pos);
+
+    // [到终点悬停] 到达最后一个轨迹点就无条件悬停(发零速度),等待手飞接管,
+    // 不再由避障产生任何速度。绕过避障/latch,避免终点附近一直避障导致停不下来。
+    {
+        const double dist_to_last = (path_pts_.back() - current_pos).norm();
+        const bool near_last_index = (i_near + 2 >= path_pts_.size());  // 到倒数第2个点
+        if (near_last_index || dist_to_last < reach_end_dist_) {
+            vx = vy = vz = yaw_deg = 0.0;
+            stage2_mode_ = Stage2FollowMode::CRUISE;
+            finished = true;
+            ROS_INFO_THROTTLE(0.5, "[STAGE2_END] 到达最后轨迹点(i_near=%zu/%zu dist=%.2f),悬停等待接管",
+                              i_near, path_pts_.size(), dist_to_last);
+            return;
+        }
+    }
+
     const ros::Time xy_now = ros::Time::now();
     double horiz_speed = 0.0;
     if (!xy_speed_inited_) {
